@@ -144,7 +144,7 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
         text = data['text'][i].strip()
         conf = int(data['conf'][i])
 
-        if conf < 40 or len(text) < 2:
+        if conf < 20 or len(text) < 2:  # low threshold — floor plan text is small
             i += 1
             continue
 
@@ -191,20 +191,9 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
             i = j
             continue
 
-        # Must contain a room-related keyword (check each word individually)
         lower = full_text.lower()
-        ROOM_KEYWORDS = {
-            'room', 'rm', 'bed', 'bdrm', 'br', 'bath', 'ba', 'bathroom',
-            'kitchen', 'kit', 'dining', 'living', 'great', 'master', 'mstr',
-            'mbr', 'hall', 'hallway', 'closet', 'wic', 'laundry',
-            'porch', 'patio', 'garage', 'study', 'office', 'stair', 'stairs',
-            'powder', 'pwdr', 'elevator', 'covered', 'balcony', 'storage',
-            'pantry', 'foyer', 'entry', 'family', 'loft', 'bonus', 'media',
-            'library', 'gym', 'utility', 'sitting', 'den', 'sunroom', 'mud',
-            'breakfast', 'nook', 'walk', 'rec', 'flex', 'workshop',
-        }
-        words = set(re.sub(r'[^a-z\s]', '', lower).split())
-        if not (words & ROOM_KEYWORDS):
+        # Accept any text with 3+ letters (keyword filter was too aggressive)
+        if len(re.sub(r'[^a-zA-Z]', '', full_text)) < 3:
             i = j
             continue
 
@@ -514,6 +503,47 @@ def _dedup_openings(openings: list) -> list:
     return unique
 
 
+def _flood_fill_rooms(wall_mask, h: int, w: int) -> list:
+    """Flood-fill fallback: tries multiple kernel sizes to find enclosed regions."""
+    min_area = w * h * 0.002
+    max_area = w * h * 0.55
+    best = []
+    for ksize in [3, 5, 7, 9, 11, 15]:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+        closed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k)
+        floor = cv2.bitwise_not(closed)
+        margin = max(5, min(w,h)//40)
+        floor[:margin,:]=0; floor[-margin:,:]=0
+        floor[:,:margin]=0; floor[:,-margin:]=0
+        n, _, stats, centroids = cv2.connectedComponentsWithStats(floor, 8)
+        regions = []
+        for lbl in range(1, n):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if area < min_area or area > max_area: continue
+            x  = stats[lbl, cv2.CC_STAT_LEFT]
+            y  = stats[lbl, cv2.CC_STAT_TOP]
+            bw = stats[lbl, cv2.CC_STAT_WIDTH]
+            bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+            if max(bw,bh)/max(min(bw,bh),1) > 12: continue
+            regions.append({
+                "box": {
+                    "top":    round(y/h*100, 3),
+                    "left":   round(x/w*100, 3),
+                    "width":  round(bw/w*100, 3),
+                    "height": round(bh/h*100, 3),
+                },
+                "area_px":    int(area),
+                "centroid_x": float(centroids[lbl][0]),
+                "centroid_y": float(centroids[lbl][1]),
+            })
+        if len(regions) > len(best):
+            best = regions
+        if len(regions) >= 4:
+            break
+    best.sort(key=lambda r: r["area_px"], reverse=True)
+    return best[:15]
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(
@@ -531,8 +561,47 @@ async def analyse_floor_plan(
     # OCR to find room labels and their positions
     ocr_rooms = ocr_find_rooms(grey, h, w)
 
-    # Build room boxes by expanding from OCR text positions until hitting walls
-    rooms     = build_room_boxes(ocr_rooms, walls, h, w, project_id)
+    # If OCR found fewer than 3 rooms, supplement with flood-fill region detection
+    # This handles cases where Tesseract can't read the floor plan text
+    if len(ocr_rooms) < 3:
+        log.info(f"  OCR found only {len(ocr_rooms)} rooms — running flood-fill fallback")
+        flood_regions = _flood_fill_rooms(wall_mask, h, w)
+        if flood_regions:
+            # Build rooms from flood-fill regions, name them generically
+            fallback_rooms = []
+            for i, reg in enumerate(flood_regions):
+                fallback_rooms.append({
+                    "id":         f"{project_id}-r{i+1}",
+                    "name":       f"Room {i+1}",
+                    "confidence": 50,
+                    "color":      FALLBACK_COLORS[i % len(FALLBACK_COLORS)],
+                    "box":        reg["box"],
+                })
+            # Merge: use OCR rooms for named ones, flood-fill for the rest
+            # Replace flood rooms with OCR rooms where positions match
+            ocr_built = build_room_boxes(ocr_rooms, walls, h, w, project_id)
+            # Start with flood-fill, overlay OCR names where centroids match
+            for ocr_r in ocr_built:
+                # Find closest flood-fill room
+                ocr_cx = (ocr_r["box"]["left"] + ocr_r["box"]["width"]/2)
+                ocr_cy = (ocr_r["box"]["top"] + ocr_r["box"]["height"]/2)
+                best_i, best_d = -1, float("inf")
+                for fi, fr in enumerate(fallback_rooms):
+                    fc_x = fr["box"]["left"] + fr["box"]["width"]/2
+                    fc_y = fr["box"]["top"]  + fr["box"]["height"]/2
+                    d = ((ocr_cx-fc_x)**2 + (ocr_cy-fc_y)**2)**0.5
+                    if d < best_d:
+                        best_d, best_i = d, fi
+                if best_i >= 0 and best_d < 30:
+                    fallback_rooms[best_i]["name"]  = ocr_r["name"]
+                    fallback_rooms[best_i]["color"] = ocr_r["color"]
+                    fallback_rooms[best_i]["confidence"] = ocr_r["confidence"]
+            rooms = fallback_rooms
+        else:
+            rooms = build_room_boxes(ocr_rooms, walls, h, w, project_id)
+    else:
+        # Build room boxes by expanding from OCR text positions until hitting walls
+        rooms = build_room_boxes(ocr_rooms, walls, h, w, project_id)
 
     # Openings
     openings  = detect_openings(wall_mask, h, w)
