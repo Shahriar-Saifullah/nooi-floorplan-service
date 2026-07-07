@@ -79,9 +79,7 @@ def preprocess(img_bytes: bytes):
 
 def ocr_find_rooms(grey, h: int, w: int) -> list:
     """
-    Use Tesseract to find all text blocks in the floor plan.
-    Returns list of {text, cx, cy, bx, by, bw, bh} for each text label
-    that looks like a room name (not a dimension like "14.7 x 16").
+    Use Tesseract to find room label text positions in the floor plan.
     """
     try:
         import pytesseract
@@ -89,51 +87,84 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
         log.warning("pytesseract not available")
         return []
 
-    # Upscale for better OCR accuracy
-    scale = max(1.5, 1800 / max(w, h))
+    # Upscale significantly for better OCR on small floor plan text
+    scale = max(2.0, 2000 / max(w, h))
     upscaled = cv2.resize(grey, None, fx=scale, fy=scale,
                           interpolation=cv2.INTER_CUBIC)
 
-    # High contrast for OCR
-    _, binary = cv2.threshold(upscaled, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Floor plans have dark text on white — ensure that
+    # Denoise before thresholding
+    denoised = cv2.fastNlMeansDenoising(upscaled, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Adaptive threshold — handles uneven lighting better than global Otsu
+    binary = cv2.adaptiveThreshold(
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 10
+    )
+
+    # Floor plans: dark text on white bg
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
     try:
         data = pytesseract.image_to_data(
             binary,
-            config='--psm 11 --oem 3',
+            config='--psm 11 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ./-',
             output_type=pytesseract.Output.DICT,
         )
     except Exception as e:
         log.error(f"Tesseract error: {e}")
         return []
 
-    rooms = []
+    # Known non-room strings to skip
+    SKIP_EXACT = {
+        'up', 'dn', 'ref', 'dw', 'ac', 'wh', 'p', 'o', 'a',
+        '1st floor plan', 'floor plan', '2nd floor plan',
+        'north', 'scale', 'date', 'drawn', 'copyright',
+        'clg', 'vaulted', 'elev',
+    }
+    # Skip if text matches these patterns
+    SKIP_PATTERNS = [
+        r'^[\d\s\'.\"xX×\/\-\+\(\)]+$',  # pure numbers/dimensions
+        r'^\d+[\s]*[xX×][\s]*\d+',         # dimensions like 14x16
+        r'^[a-z]{1,2}$',                    # very short lowercase fragments
+        r'^\W+$',                            # punctuation only
+    ]
+
+    # Known room keywords — must contain at least one of these to be considered a room
+    ROOM_KEYWORDS = [
+        'room', 'bed', 'bath', 'kitchen', 'dining', 'living', 'great',
+        'master', 'hall', 'closet', 'wic', 'laundry', 'porch', 'patio',
+        'garage', 'study', 'office', 'stair', 'powder', 'pwdr', 'elevator',
+        'covered', 'balcony', 'storage', 'pantry', 'foyer', 'entry',
+        'family', 'loft', 'bonus', 'media', 'library', 'gym', 'utility',
+    ]
+
     n = len(data['text'])
+    candidates = []
     i = 0
+
     while i < n:
         text = data['text'][i].strip()
         conf = int(data['conf'][i])
 
-        if conf < 30 or len(text) < 2:
+        if conf < 40 or len(text) < 2:
             i += 1
             continue
 
-        # Skip dimension strings: "14.7", "x", "16", "9 CLG", etc.
-        if re.match(r'^[\d\s\'.\"]+$', text):
-            i += 1
-            continue
-        if re.match(r'^[xX×]$', text):
+        # Skip known non-room text
+        if text.lower() in SKIP_EXACT:
             i += 1
             continue
 
-        # Try to merge adjacent words on the same line into a phrase
-        # (room names like "MASTER BED RM" span multiple words)
+        # Skip pattern matches
+        if any(re.match(p, text) for p in SKIP_PATTERNS):
+            i += 1
+            continue
+
+        # Merge adjacent words on same line in same block
         phrase_words = [text]
-        phrase_conf  = [conf]
+        phrase_confs = [conf]
         bx = data['left'][i]
         by = data['top'][i]
         bw = data['width'][i]
@@ -143,35 +174,39 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
 
         j = i + 1
         while j < n:
-            next_text = data['text'][j].strip()
-            next_conf = int(data['conf'][j])
+            nt = data['text'][j].strip()
+            nc = int(data['conf'][j])
             if (data['block_num'][j] == block and
                     data['line_num'][j] == line and
-                    next_conf >= 30 and len(next_text) >= 1):
-                if not re.match(r'^[\d\s\'.\"xX×]+$', next_text):
-                    phrase_words.append(next_text)
-                    phrase_conf.append(next_conf)
+                    nc >= 30 and len(nt) >= 1):
+                # Don't merge pure dimension strings
+                if not re.match(r'^[\d\s\'.\"xX×\/]+$', nt):
+                    phrase_words.append(nt)
+                    phrase_confs.append(nc)
                     bw = (data['left'][j] + data['width'][j]) - bx
+                j += 1
             else:
                 break
-            j += 1
 
-        # Also check next line if it's part of the same block (e.g. "MASTER BED RM\n14.7x16")
         full_text = " ".join(phrase_words).strip()
 
-        # Filter: must be a meaningful room name (letters, not just numbers)
+        # Must contain letters
         if not re.search(r'[A-Za-z]{2,}', full_text):
             i = j
             continue
 
-        # Filter common non-room text
-        skip_words = ['clg', 'vault', 'plan', 'floor', 'scale', 'north',
-                      'copyright', 'note', 'drawn', 'date', 'sheet']
-        if any(sw in full_text.lower() for sw in skip_words):
+        # Must contain a room keyword
+        lower = full_text.lower()
+        if not any(kw in lower for kw in ROOM_KEYWORDS):
             i = j
             continue
 
-        # Convert bbox back to original image coordinates
+        # Skip if it's clearly the title/annotation
+        if any(skip in lower for skip in ['floor plan', 'copyright', 'scale', 'north']):
+            i = j
+            continue
+
+        # Convert bbox to original image coords
         orig_bx = int(bx / scale)
         orig_by = int(by / scale)
         orig_bw = max(1, int(bw / scale))
@@ -179,17 +214,16 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
         cx = orig_bx + orig_bw // 2
         cy = orig_by + orig_bh // 2
 
-        rooms.append({
+        candidates.append({
             "text": full_text,
             "cx": cx, "cy": cy,
             "bx": orig_bx, "by": orig_by,
             "bw": orig_bw, "bh": orig_bh,
-            "conf": int(np.mean(phrase_conf)),
+            "conf": int(np.mean(phrase_confs)),
         })
         i = j
 
-    # Deduplicate overlapping text detections
-    rooms = _dedup_text_boxes(rooms)
+    rooms = _dedup_text_boxes(candidates)
     log.info(f"  OCR found {len(rooms)} room labels")
     for r in rooms:
         log.info(f"    '{r['text']}' at ({r['cx']}, {r['cy']})")
@@ -428,9 +462,10 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
             })
 
     # Windows — short parallel line segments directly on walls
+    # Only look on the outer wall boundary (exterior windows)
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
-    min_win = max(10, min(w,h)//40)
-    max_win = max(w,h)//10
+    min_win = max(12, min(w,h)//35)
+    max_win = max(w,h)//12  # stricter max
 
     for kern, orient in [
         (cv2.getStructuringElement(cv2.MORPH_RECT, (min_win,1)), "horizontal"),
@@ -439,11 +474,16 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
         m = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kern)
         n, _, st, ct = cv2.connectedComponentsWithStats(m, 8)
         for lbl in range(1, n):
-            seg_len = st[lbl,cv2.CC_STAT_WIDTH] if orient=="horizontal" else st[lbl,cv2.CC_STAT_HEIGHT]
+            seg_w = st[lbl,cv2.CC_STAT_WIDTH]
+            seg_h = st[lbl,cv2.CC_STAT_HEIGHT]
+            seg_len = seg_w if orient=="horizontal" else seg_h
+            seg_perp = seg_h if orient=="horizontal" else seg_w
             if seg_len < min_win or seg_len > max_win: continue
-            if st[lbl,cv2.CC_STAT_AREA] < 15: continue
+            if st[lbl,cv2.CC_STAT_AREA] < 20: continue
+            # Window symbol is thin in the perpendicular direction
+            if seg_perp > min_win * 2: continue
             icx,icy = int(ct[lbl][0]), int(ct[lbl][1])
-            roi = wall_mask[max(0,icy-3):min(h,icy+3), max(0,icx-3):min(w,icx+3)]
+            roi = wall_mask[max(0,icy-4):min(h,icy+4), max(0,icx-4):min(w,icx+4)]
             if roi.max() < 128: continue
             openings.append({
                 "type":  "window",
