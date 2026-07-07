@@ -1,6 +1,6 @@
 """
 Floor Plan Analysis Pipeline — OpenCV + Tesseract
-Uses adaptive thresholds and multiple detection strategies.
+Improved room detection using morphological reconstruction.
 """
 import logging, re, cv2, numpy as np
 
@@ -47,16 +47,13 @@ def preprocess(img_bytes: bytes):
 
 def detect_walls(wall_mask, h: int, w: int) -> list:
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
-    # Use lower threshold to catch more wall segments
     min_len = max(w, h) * 0.025
     max_gap = max(w, h) * 0.025
-
     raw = cv2.HoughLinesP(edges, 1, np.pi/180, 30,
                           minLineLength=int(min_len),
                           maxLineGap=int(max_gap))
     if raw is None:
         return []
-
     walls = []
     for line in raw:
         x1, y1, x2, y2 = line[0]
@@ -68,7 +65,6 @@ def detect_walls(wall_mask, h: int, w: int) -> list:
             "x2": round(x2/w*100, 3), "y2": round(y2/h*100, 3),
             "thickness": round(thick/max(w,h)*100, 3),
         })
-
     walls = _dedup_walls(walls)
     log.info(f"  Walls: {len(walls)} segments")
     return walls
@@ -121,114 +117,53 @@ def _dedup_walls(walls: list) -> list:
 
 def detect_room_regions(wall_mask, h: int, w: int) -> list:
     """
-    Multi-strategy approach:
-    1. Try standard flood-fill with progressively larger closing kernels
-    2. If that fails, draw Hough walls onto canvas and flood-fill
-    3. If that still fails, use contour-based region detection
-    Always returns at least the largest candidate regions found.
+    Key insight: floor plan walls are thin lines. Standard morphological 
+    closing merges adjacent rooms because it erases thin walls.
+    
+    Solution: use SMALL closing kernel (just to seal tiny gaps at wall 
+    endpoints) then use WATERSHED or distance-transform to properly 
+    separate touching regions.
     """
-    # Strategy 1: Progressive closing on raw wall mask
-    regions = _flood_fill_strategy(wall_mask, h, w, source="raw")
-    if len(regions) >= 2:
-        log.info(f"  Room regions: {len(regions)} (strategy: raw mask)")
-        return regions
-
-    # Strategy 2: Draw Hough lines onto blank canvas then flood-fill
-    edges = cv2.Canny(wall_mask, 30, 120, apertureSize=3)
-    canvas = np.zeros((h, w), np.uint8)
-    raw = cv2.HoughLinesP(edges, 1, np.pi/180, 25,
-                          minLineLength=int(max(w,h)*0.02),
-                          maxLineGap=int(max(w,h)*0.03))
-    if raw is not None:
-        for line in raw:
-            x1,y1,x2,y2 = line[0]
-            cv2.line(canvas, (x1,y1), (x2,y2), 255, 4)
-    combined = cv2.bitwise_or(canvas, wall_mask)
-    regions = _flood_fill_strategy(combined, h, w, source="hough_canvas")
-    if len(regions) >= 2:
-        log.info(f"  Room regions: {len(regions)} (strategy: Hough canvas)")
-        return regions
-
-    # Strategy 3: Contour-based — find large closed contours in the wall image
-    regions = _contour_strategy(wall_mask, h, w)
-    if regions:
-        log.info(f"  Room regions: {len(regions)} (strategy: contours)")
-        return regions
-
-    # Strategy 4: Last resort — divide image into grid based on wall line intersections
-    regions = _grid_strategy(wall_mask, h, w)
-    log.info(f"  Room regions: {len(regions)} (strategy: grid fallback)")
-    return regions
-
-
-def _flood_fill_strategy(mask, h, w, source="") -> list:
-    """Try progressively larger closing kernels until rooms appear."""
-    min_area = w * h * 0.003
+    
+    # Step 1: Seal only tiny endpoint gaps (kernel=3, not 13)
+    k_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    sealed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k_small)
+    
+    # Step 2: Floor = not wall, remove border
+    floor = cv2.bitwise_not(sealed)
+    margin = max(5, min(w,h)//40)
+    floor[:margin,:]=0; floor[-margin:,:]=0
+    floor[:,:margin]=0; floor[:,-margin:]=0
+    
+    # Step 3: Distance transform — finds room centers (peaks = far from walls)
+    dist = cv2.distanceTransform(floor, cv2.DIST_L2, 5)
+    cv2.normalize(dist, dist, 0, 1.0, cv2.NORM_MINMAX)
+    
+    # Step 4: Threshold distance to find "sure foreground" (room centers)
+    # Use a lower threshold to find more room seeds
+    _, sure_fg = cv2.threshold(dist, 0.15, 1.0, cv2.THRESH_BINARY)
+    sure_fg = np.uint8(sure_fg * 255)
+    
+    # Step 5: Find connected room seeds
+    n, markers, stats, centroids = cv2.connectedComponentsWithStats(sure_fg, 8)
+    
+    min_area = w * h * 0.002  # lower threshold to catch small rooms
     max_area = w * h * 0.55
-    best_regions = []
-
-    for ksize in [5, 9, 13, 19, 27]:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
-        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-        # Also dilate to connect nearby walls
-        closed = cv2.dilate(closed, cv2.getStructuringElement(cv2.MORPH_RECT, (3,3)))
-        floor = cv2.bitwise_not(closed)
-        margin = max(5, min(w,h)//40)
-        floor[:margin,:]=0; floor[-margin:,:]=0
-        floor[:,:margin]=0; floor[:,-margin:]=0
-
-        n, labels, stats, centroids = cv2.connectedComponentsWithStats(floor, 8)
-        regions = []
-        for lbl in range(1, n):
-            area = stats[lbl, cv2.CC_STAT_AREA]
-            if area < min_area or area > max_area:
-                continue
-            x  = stats[lbl, cv2.CC_STAT_LEFT]
-            y  = stats[lbl, cv2.CC_STAT_TOP]
-            bw = stats[lbl, cv2.CC_STAT_WIDTH]
-            bh = stats[lbl, cv2.CC_STAT_HEIGHT]
-            aspect = max(bw,bh) / max(min(bw,bh), 1)
-            if aspect > 12: continue
-            regions.append({
-                "box": {
-                    "top":    round(y/h*100, 3),
-                    "left":   round(x/w*100, 3),
-                    "width":  round(bw/w*100, 3),
-                    "height": round(bh/h*100, 3),
-                },
-                "area_px":    int(area),
-                "centroid_x": float(centroids[lbl][0]),
-                "centroid_y": float(centroids[lbl][1]),
-                "pixel_x": int(x), "pixel_y": int(y),
-                "pixel_w": int(bw), "pixel_h": int(bh),
-            })
-        regions.sort(key=lambda r: r["area_px"], reverse=True)
-        if len(regions) > len(best_regions):
-            best_regions = regions
-        if len(regions) >= 2:
-            return regions
-
-    return best_regions
-
-
-def _contour_strategy(wall_mask, h, w) -> list:
-    """Find closed contours as room boundaries."""
-    min_area = w * h * 0.005
-    max_area = w * h * 0.55
-    # Close gaps in walls
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k)
-    contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
     regions = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
+    for lbl in range(1, n):
+        area = stats[lbl, cv2.CC_STAT_AREA]
         if area < min_area or area > max_area:
             continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        M = cv2.moments(cnt)
-        if M["m00"] == 0: continue
-        cx = M["m10"]/M["m00"]
-        cy = M["m01"]/M["m00"]
+        x  = stats[lbl, cv2.CC_STAT_LEFT]
+        y  = stats[lbl, cv2.CC_STAT_TOP]
+        bw = stats[lbl, cv2.CC_STAT_WIDTH]
+        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+        
+        # Skip very thin/elongated regions (not rooms)
+        if bw < 5 or bh < 5:
+            continue
+            
         regions.append({
             "box": {
                 "top":    round(y/h*100, 3),
@@ -236,94 +171,87 @@ def _contour_strategy(wall_mask, h, w) -> list:
                 "width":  round(bw/w*100, 3),
                 "height": round(bh/h*100, 3),
             },
-            "area_px": int(area),
-            "centroid_x": float(cx),
-            "centroid_y": float(cy),
+            "area_px":    int(area),
+            "centroid_x": float(centroids[lbl][0]),
+            "centroid_y": float(centroids[lbl][1]),
+            "pixel_x": int(x), "pixel_y": int(y),
+            "pixel_w": int(bw), "pixel_h": int(bh),
+        })
+    
+    regions.sort(key=lambda r: r["area_px"], reverse=True)
+    
+    # If too many (>20), watershed is over-segmenting — merge nearby small ones
+    if len(regions) > 20:
+        regions = _merge_nearby_regions(regions, w, h)
+    
+    # If still 0, fall back to contour approach
+    if len(regions) == 0:
+        regions = _contour_fallback(wall_mask, h, w)
+    
+    log.info(f"  Room regions: {len(regions)}")
+    return regions[:15]  # cap at 15
+
+
+def _merge_nearby_regions(regions: list, w: int, h: int) -> list:
+    """Merge regions whose centroids are very close together."""
+    DIST_THRESH = max(w, h) * 0.05  # 5% of image
+    merged_flags = set()
+    result = []
+    for i, a in enumerate(regions):
+        if i in merged_flags:
+            continue
+        group = [a]
+        for j, b in enumerate(regions):
+            if j <= i or j in merged_flags:
+                continue
+            dist = np.hypot(a["centroid_x"]-b["centroid_x"],
+                           a["centroid_y"]-b["centroid_y"])
+            if dist < DIST_THRESH:
+                group.append(b)
+                merged_flags.add(j)
+        # Use the largest region in the group
+        group.sort(key=lambda r: r["area_px"], reverse=True)
+        result.append(group[0])
+        merged_flags.add(i)
+    return result
+
+
+def _contour_fallback(wall_mask, h, w) -> list:
+    """Contour-based room detection as final fallback."""
+    min_area = w * h * 0.003
+    max_area = w * h * 0.55
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k)
+    contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    regions = []
+    if hierarchy is None:
+        return regions
+    for i, cnt in enumerate(contours):
+        # Only use inner contours (holes in walls = rooms)
+        if hierarchy[0][i][3] == -1:  # no parent = outer contour, skip
+            continue
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        regions.append({
+            "box": {
+                "top":    round(y/h*100, 3),
+                "left":   round(x/w*100, 3),
+                "width":  round(bw/w*100, 3),
+                "height": round(bh/h*100, 3),
+            },
+            "area_px":    int(area),
+            "centroid_x": float(M["m10"]/M["m00"]),
+            "centroid_y": float(M["m01"]/M["m00"]),
             "pixel_x": x, "pixel_y": y,
             "pixel_w": bw, "pixel_h": bh,
         })
     regions.sort(key=lambda r: r["area_px"], reverse=True)
-    # Remove regions that contain other regions (keep children not parents)
-    filtered = []
-    for i, r in enumerate(regions):
-        is_parent = any(
-            j != i and
-            regions[j]["box"]["left"]  >= r["box"]["left"] and
-            regions[j]["box"]["top"]   >= r["box"]["top"] and
-            regions[j]["box"]["left"] + regions[j]["box"]["width"]  <= r["box"]["left"] + r["box"]["width"] and
-            regions[j]["box"]["top"]  + regions[j]["box"]["height"] <= r["box"]["top"]  + r["box"]["height"]
-            for j in range(len(regions))
-        )
-        if not is_parent:
-            filtered.append(r)
-    return filtered[:15]
-
-
-def _grid_strategy(wall_mask, h, w) -> list:
-    """
-    Last resort: find horizontal and vertical wall lines, use their
-    intersections to infer room grid cells.
-    """
-    edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
-    raw = cv2.HoughLinesP(edges, 1, np.pi/180, 25,
-                          minLineLength=int(max(w,h)*0.08),
-                          maxLineGap=int(max(w,h)*0.04))
-    if raw is None:
-        return []
-
-    h_lines, v_lines = [], []
-    for line in raw:
-        x1,y1,x2,y2 = line[0]
-        if abs(x2-x1) > abs(y2-y1):
-            h_lines.append(sorted([y1,y2]))
-        else:
-            v_lines.append(sorted([x1,x2]))
-
-    if not h_lines or not v_lines:
-        return []
-
-    # Cluster line positions
-    def cluster(vals, gap=h*0.04):
-        if not vals: return []
-        vals = sorted(set(v[0] for v in vals))
-        clusters, cur = [[vals[0]]], vals[0]
-        for v in vals[1:]:
-            if v - cur < gap: clusters[-1].append(v)
-            else: clusters.append([v]); cur = v
-        return [sum(c)//len(c) for c in clusters]
-
-    hy = cluster(h_lines, h*0.04)
-    vx = cluster(v_lines, w*0.04)
-
-    if len(hy) < 2 or len(vx) < 2:
-        return []
-
-    # Each cell between consecutive lines is a potential room
-    min_area = w * h * 0.003
-    regions = []
-    for i in range(len(hy)-1):
-        for j in range(len(vx)-1):
-            x, y = vx[j], hy[i]
-            bw = vx[j+1] - vx[j]
-            bh = hy[i+1]  - hy[i]
-            area = bw * bh
-            if area < min_area: continue
-            regions.append({
-                "box": {
-                    "top":    round(y/h*100, 3),
-                    "left":   round(x/w*100, 3),
-                    "width":  round(bw/w*100, 3),
-                    "height": round(bh/h*100, 3),
-                },
-                "area_px":    area,
-                "centroid_x": float(x + bw/2),
-                "centroid_y": float(y + bh/2),
-                "pixel_x": x, "pixel_y": y,
-                "pixel_w": bw, "pixel_h": bh,
-            })
-
-    regions.sort(key=lambda r: r["area_px"], reverse=True)
-    return regions[:12]
+    return regions
 
 # ── 4. OCR room naming ────────────────────────────────────────────────────────
 
@@ -336,11 +264,9 @@ def ocr_room_names(grey, regions: list, h: int, w: int) -> list:
         log.warning("pytesseract not available")
 
     scale = max(1.0, 1500/max(w,h))
-    if tess_ok and scale > 1.2:
+    if tess_ok:
         ocr_img = cv2.resize(cv2.bitwise_not(grey), None, fx=scale, fy=scale,
-                             interpolation=cv2.INTER_CUBIC)
-    elif tess_ok:
-        ocr_img = cv2.bitwise_not(grey)
+                             interpolation=cv2.INTER_CUBIC) if scale > 1.2 else cv2.bitwise_not(grey)
     else:
         ocr_img = None
 
@@ -348,7 +274,7 @@ def ocr_room_names(grey, regions: list, h: int, w: int) -> list:
     for idx, region in enumerate(regions):
         raw_name = ""
         if tess_ok and ocr_img is not None:
-            pad = 8
+            pad = 10
             px = max(0, int(region["pixel_x"]*scale)-pad)
             py = max(0, int(region["pixel_y"]*scale)-pad)
             pw = min(ocr_img.shape[1], int((region["pixel_x"]+region["pixel_w"])*scale)+pad)
@@ -364,7 +290,6 @@ def ocr_room_names(grey, regions: list, h: int, w: int) -> list:
                     lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 1]
                     lines = [l for l in lines if not re.match(r'^[\d\s\'.\"xX×\/\-]+$', l)]
                     lines = [l for l in lines if not re.search(r'\d+[\s]*[xX×][\s]*\d+', l)]
-                    lines = [l for l in lines if len(l) > 1]
                     if lines:
                         raw_name = " ".join(lines[:2]).strip()
                         raw_name = " ".join(word.capitalize() for word in raw_name.split())
@@ -401,18 +326,20 @@ def _guess_room_type(region: dict, idx: int) -> str:
 def detect_openings(wall_mask, h: int, w: int) -> list:
     openings = []
 
-    # Doors — arc detection
+    # Doors — arc detection with strict wall proximity
     blurred = cv2.GaussianBlur(wall_mask, (5,5), 0)
     circles = cv2.HoughCircles(
         blurred, cv2.HOUGH_GRADIENT, dp=1.2,
-        minDist=max(w,h)*0.04, param1=50, param2=20,
-        minRadius=int(max(w,h)*0.025), maxRadius=int(max(w,h)*0.12),
+        minDist=max(w,h)*0.05,
+        param1=60, param2=25,
+        minRadius=int(max(w,h)*0.025),
+        maxRadius=int(max(w,h)*0.10),
     )
     if circles is not None:
         for cx, cy, r in np.round(circles[0]).astype(int):
             x0,y0 = max(0,cx-r-4), max(0,cy-r-4)
             x1b,y1b = min(w,cx+r+4), min(h,cy+r+4)
-            if float(np.mean(wall_mask[y0:y1b,x0:x1b]>128)) < 0.08:
+            if float(np.mean(wall_mask[y0:y1b,x0:x1b]>128)) < 0.10:
                 continue
             hd = float(np.mean(wall_mask[max(0,cy-3):min(h,cy+3),max(0,cx-r):min(w,cx+r)]>128))
             vd = float(np.mean(wall_mask[max(0,cy-r):min(h,cy+r),max(0,cx-3):min(w,cx+3)]>128))
@@ -424,10 +351,10 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
                 "width": max(80.0, round(r*2/max(w,h)*1000, 2)),
             })
 
-    # Windows — short parallel line segments on walls
+    # Windows — strict: must be on wall, correct size range
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
-    min_win = max(8, min(w,h)//50)
-    max_win = max(w,h)//8
+    min_win = max(10, min(w,h)//40)
+    max_win = max(w,h)//10
 
     for kern, orient in [
         (cv2.getStructuringElement(cv2.MORPH_RECT, (min_win,1)), "horizontal"),
@@ -438,11 +365,11 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
         for lbl in range(1, n):
             seg_len = st[lbl, cv2.CC_STAT_WIDTH] if orient=="horizontal" else st[lbl, cv2.CC_STAT_HEIGHT]
             if seg_len < min_win or seg_len > max_win: continue
-            if st[lbl, cv2.CC_STAT_AREA] < 10: continue
-            cx, cy = int(ct[lbl][0]), int(ct[lbl][1])
-            # Must be on a wall pixel
-            if wall_mask[max(0,cy-2):min(h,cy+2), max(0,cx-2):min(w,cx+2)].max() < 128:
-                continue
+            if st[lbl, cv2.CC_STAT_AREA] < 15: continue
+            icx, icy = int(ct[lbl][0]), int(ct[lbl][1])
+            # Must sit directly on a wall pixel
+            roi = wall_mask[max(0,icy-3):min(h,icy+3), max(0,icx-3):min(w,icx+3)]
+            if roi.max() < 128: continue
             openings.append({
                 "type":  "window",
                 "wall":  orient,
