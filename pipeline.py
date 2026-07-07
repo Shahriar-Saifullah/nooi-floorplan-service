@@ -116,28 +116,24 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
         log.error(f"Tesseract error: {e}")
         return []
 
-    # Known non-room strings to skip
+    # Known non-room strings to skip exactly
     SKIP_EXACT = {
-        'up', 'dn', 'ref', 'dw', 'ac', 'wh', 'p', 'o', 'a',
-        '1st floor plan', 'floor plan', '2nd floor plan',
-        'north', 'scale', 'date', 'drawn', 'copyright',
-        'clg', 'vaulted', 'elev',
+        'up', 'dn', 'ref', 'dw', 'ac', 'wh', 'clg', 'elev',
+        'p', 'o', 'a', 'i', 'e', 'r', 'rp', 'lf', 'ro',
     }
-    # Skip if text matches these patterns
+    # Skip if text matches these patterns (dimensions, numbers, fragments)
     SKIP_PATTERNS = [
-        r'^[\d\s\'.\"xX×\/\-\+\(\)]+$',  # pure numbers/dimensions
-        r'^\d+[\s]*[xX×][\s]*\d+',         # dimensions like 14x16
-        r'^[a-z]{1,2}$',                    # very short lowercase fragments
-        r'^\W+$',                            # punctuation only
+        r'^[\d\s\'.\"xX×\/\-\+\(\)°]+$',  # pure numbers/dimensions
+        r'^\d+[\s]*[xX×][\s]*\d+',          # dimensions like 14x16
+        r'^[a-z]{1,2}$',                     # very short lowercase (OCR noise)
+        r'^\W+$',                             # punctuation only
+        r'^[A-Z]{1,2}$',                     # very short uppercase (initials)
     ]
-
-    # Known room keywords — must contain at least one of these to be considered a room
-    ROOM_KEYWORDS = [
-        'room', 'bed', 'bath', 'kitchen', 'dining', 'living', 'great',
-        'master', 'hall', 'closet', 'wic', 'laundry', 'porch', 'patio',
-        'garage', 'study', 'office', 'stair', 'powder', 'pwdr', 'elevator',
-        'covered', 'balcony', 'storage', 'pantry', 'foyer', 'entry',
-        'family', 'loft', 'bonus', 'media', 'library', 'gym', 'utility',
+    # Known non-room annotations to skip
+    SKIP_CONTAINS = [
+        'floor plan', 'copyright', 'scale', 'north arrow',
+        '1st fl', '2nd fl', 'drawn by', 'date', 'sheet',
+        'plan note', 'revision',
     ]
 
     n = len(data['text'])
@@ -195,9 +191,20 @@ def ocr_find_rooms(grey, h: int, w: int) -> list:
             i = j
             continue
 
-        # Must contain a room keyword
+        # Must contain a room-related keyword (check each word individually)
         lower = full_text.lower()
-        if not any(kw in lower for kw in ROOM_KEYWORDS):
+        ROOM_KEYWORDS = {
+            'room', 'rm', 'bed', 'bdrm', 'br', 'bath', 'ba', 'bathroom',
+            'kitchen', 'kit', 'dining', 'living', 'great', 'master', 'mstr',
+            'mbr', 'hall', 'hallway', 'closet', 'wic', 'laundry',
+            'porch', 'patio', 'garage', 'study', 'office', 'stair', 'stairs',
+            'powder', 'pwdr', 'elevator', 'covered', 'balcony', 'storage',
+            'pantry', 'foyer', 'entry', 'family', 'loft', 'bonus', 'media',
+            'library', 'gym', 'utility', 'sitting', 'den', 'sunroom', 'mud',
+            'breakfast', 'nook', 'walk', 'rec', 'flex', 'workshop',
+        }
+        words = set(re.sub(r'[^a-z\s]', '', lower).split())
+        if not (words & ROOM_KEYWORDS):
             i = j
             continue
 
