@@ -1,19 +1,25 @@
 """
 Floor Plan Analysis Pipeline
 -----------------------------
-Architecture:
-  1. Tesseract OCR  — finds room label text positions in the image
-  2. Wall network   — OpenCV Hough lines for wall segments  
-  3. Room boxes     — built from OCR text positions + wall intersections
-  4. Door detection — arc symbols via Hough circles
-  5. Window detect  — parallel line patterns on walls
+Architecture (final):
+  Step 1: Roboflow    — precise wall segments, doors, windows (pixel coords)
+  Step 2: Gemini      — room names + dimensions ONLY (not geometry)
+  Step 3: OpenCV      — room regions from wall network
+  Step 4: Match       — pair Gemini names to OpenCV regions by centroid
+  Step 5: Normalise   — all coords as 0-100% of image dimensions
 
-No external AI APIs. Pure OpenCV + Tesseract.
+Gemini is used ONLY for what it's good at: reading text and dimensions.
+OpenCV is used ONLY for what it's good at: pixel geometry.
+Roboflow is used ONLY for what it's good at: trained wall/door/window detection.
 """
 
+import asyncio
+import base64
+import json
 import logging
 import re
 import cv2
+import httpx
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -21,30 +27,18 @@ log = logging.getLogger(__name__)
 # ── Color palette ─────────────────────────────────────────────────────────────
 
 ROOM_COLORS = {
-    "living":     "#c3f4f0",
-    "great":      "#c3f4f0",
-    "kitchen":    "#b9eac5",
-    "bedroom":    "#87ddd7",
-    "master":     "#6dd0c4",
-    "bath":       "#f7dfad",
-    "hall":       "#d5dbda",
-    "corridor":   "#d5dbda",
-    "storage":    "#ffc9c0",
-    "closet":     "#ffc9c0",
-    "wic":        "#ffc9c0",
-    "dining":     "#c7d2fe",
-    "study":      "#fde68a",
-    "office":     "#fde68a",
-    "porch":      "#a7f3d0",
-    "patio":      "#a7f3d0",
-    "balcony":    "#a7f3d0",
-    "stair":      "#e0c3fc",
-    "laundry":    "#ffc9c0",
-    "garage":     "#e5e7eb",
-    "elevator":   "#e5e7eb",
-    "powder":     "#f7dfad",
-    "pwdr":       "#f7dfad",
-    "covered":    "#a7f3d0",
+    "living":    "#c3f4f0", "great":    "#c3f4f0",
+    "kitchen":   "#b9eac5", "bedroom":  "#87ddd7",
+    "master":    "#6dd0c4", "bath":     "#f7dfad",
+    "hall":      "#d5dbda", "corridor": "#d5dbda",
+    "storage":   "#ffc9c0", "closet":   "#ffc9c0",
+    "wic":       "#ffc9c0", "dining":   "#c7d2fe",
+    "study":     "#fde68a", "office":   "#fde68a",
+    "porch":     "#a7f3d0", "patio":    "#a7f3d0",
+    "balcony":   "#a7f3d0", "stair":    "#e0c3fc",
+    "laundry":   "#ffc9c0", "garage":   "#e5e7eb",
+    "elevator":  "#e5e7eb", "powder":   "#f7dfad",
+    "covered":   "#a7f3d0", "pwdr":     "#f7dfad",
 }
 FALLBACK_COLORS = [
     "#c3f4f0","#b9eac5","#87ddd7","#f7dfad","#d5dbda","#ffc9c0",
@@ -57,7 +51,6 @@ def room_color(name: str, idx: int) -> str:
         if key in lower:
             return color
     return FALLBACK_COLORS[idx % len(FALLBACK_COLORS)]
-
 
 # ── 1. Pre-process ────────────────────────────────────────────────────────────
 
@@ -72,294 +65,82 @@ def preprocess(img_bytes: bytes):
     wall_mask = cv2.bitwise_not(binary) if np.mean(binary) > 127 else binary.copy()
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     wall_mask = cv2.morphologyEx(wall_mask, cv2.MORPH_OPEN, k)
-    return bgr, wall_mask, grey, h, w
+    return bgr, wall_mask, h, w
 
+# ── 2. Gemini — room names + dimensions ONLY ──────────────────────────────────
 
-# ── 2. OCR — find room labels and their positions ─────────────────────────────
-
-def ocr_find_rooms(grey, h: int, w: int) -> list:
+async def gemini_name_rooms(image_url: str, gemini_key: str) -> list:
     """
-    Use Tesseract to find room label text positions in the floor plan.
+    Ask Gemini to identify room names and read printed dimensions.
+    NOT used for geometry — only for text/label reading.
+    Returns list of {name, confidence, box_2d, dimensions}.
     """
-    try:
-        import pytesseract
-    except ImportError:
-        log.warning("pytesseract not available")
+    if not gemini_key:
         return []
 
-    # Upscale significantly for better OCR on small floor plan text
-    scale = max(2.0, 2000 / max(w, h))
-    upscaled = cv2.resize(grey, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_CUBIC)
+    prompt = """You are reading a floor plan image.
 
-    # Denoise before thresholding
-    denoised = cv2.fastNlMeansDenoising(upscaled, h=10, templateWindowSize=7, searchWindowSize=21)
+List every distinct room or space you can identify.
+Return ONLY a valid JSON array, no markdown, no explanation.
 
-    # Adaptive threshold — handles uneven lighting better than global Otsu
-    binary = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 10
-    )
+Each object must have:
+- "name": unique human-readable name (e.g. "Master Bedroom", "Kitchen")
+  Number duplicates: "Bedroom 1", "Bedroom 2"
+- "confidence": 0-100
+- "box_2d": [ymin, xmin, ymax, xmax] approximate position on 0-1000 scale
+- "dimensions": {"length": number, "width": number, "unit": "ft"|"m"} or null
+  Only include if you can clearly see printed measurements in the floor plan.
+  Convert feet-inches like 14'-7" to decimal feet (14.58).
 
-    # Floor plans: dark text on white bg
-    if np.mean(binary) < 127:
-        binary = cv2.bitwise_not(binary)
+Return ONLY the JSON array."""
 
-    try:
-        data = pytesseract.image_to_data(
-            binary,
-            config='--psm 11 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ./-',
-            output_type=pytesseract.Output.DICT,
-        )
-    except Exception as e:
-        log.error(f"Tesseract error: {e}")
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                img_resp = await c.get(image_url)
+                img_b64 = base64.b64encode(img_resp.content).decode()
+
+            payload = {
+                "contents": [{"role": "user", "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+                ]}],
+                "generationConfig": {"responseMimeType": "application/json"},
+            }
+            async with httpx.AsyncClient(timeout=45) as c:
+                r = await c.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-2.5-flash:generateContent?key={gemini_key}",
+                    json=payload,
+                )
+            if r.status_code == 503:
+                wait = [3, 6, 10][attempt]
+                log.warning(f"Gemini 503 attempt {attempt+1}, retry in {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            arr = _parse_json_array(text)
+            log.info(f"  Gemini: {len(arr)} rooms named")
+            return arr
+        except Exception as e:
+            log.error(f"Gemini attempt {attempt+1}: {e}")
+            await asyncio.sleep(3)
+    return []
+
+def _parse_json_array(text: str) -> list:
+    text = re.sub(r"^```json\s*", "", text.strip(), flags=re.I)
+    text = re.sub(r"^```\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    s, e = text.find("["), text.rfind("]")
+    if s == -1 or e == -1:
         return []
+    return json.loads(text[s:e+1])
 
-    # Known non-room strings to skip exactly
-    SKIP_EXACT = {
-        'up', 'dn', 'ref', 'dw', 'ac', 'wh', 'clg', 'elev',
-        'p', 'o', 'a', 'i', 'e', 'r', 'rp', 'lf', 'ro',
-    }
-    # Skip if text matches these patterns (dimensions, numbers, fragments)
-    SKIP_PATTERNS = [
-        r'^[\d\s\'.\"xX×\/\-\+\(\)°]+$',  # pure numbers/dimensions
-        r'^\d+[\s]*[xX×][\s]*\d+',          # dimensions like 14x16
-        r'^[a-z]{1,2}$',                     # very short lowercase (OCR noise)
-        r'^\W+$',                             # punctuation only
-        r'^[A-Z]{1,2}$',                     # very short uppercase (initials)
-    ]
-    # Known non-room annotations to skip
-    SKIP_CONTAINS = [
-        'floor plan', 'copyright', 'scale', 'north arrow',
-        '1st fl', '2nd fl', 'drawn by', 'date', 'sheet',
-        'plan note', 'revision',
-    ]
+# ── 3. OpenCV wall detection ──────────────────────────────────────────────────
 
-    n = len(data['text'])
-    candidates = []
-    i = 0
-
-    while i < n:
-        text = data['text'][i].strip()
-        conf = int(data['conf'][i])
-
-        if conf < 20 or len(text) < 2:  # low threshold — floor plan text is small
-            i += 1
-            continue
-
-        # Skip known non-room text
-        if text.lower() in SKIP_EXACT:
-            i += 1
-            continue
-
-        # Skip pattern matches
-        if any(re.match(p, text) for p in SKIP_PATTERNS):
-            i += 1
-            continue
-
-        # Merge adjacent words on same line in same block
-        phrase_words = [text]
-        phrase_confs = [conf]
-        bx = data['left'][i]
-        by = data['top'][i]
-        bw = data['width'][i]
-        bh = data['height'][i]
-        block = data['block_num'][i]
-        line  = data['line_num'][i]
-
-        j = i + 1
-        while j < n:
-            nt = data['text'][j].strip()
-            nc = int(data['conf'][j])
-            if (data['block_num'][j] == block and
-                    data['line_num'][j] == line and
-                    nc >= 30 and len(nt) >= 1):
-                # Don't merge pure dimension strings
-                if not re.match(r'^[\d\s\'.\"xX×\/]+$', nt):
-                    phrase_words.append(nt)
-                    phrase_confs.append(nc)
-                    bw = (data['left'][j] + data['width'][j]) - bx
-                j += 1
-            else:
-                break
-
-        full_text = " ".join(phrase_words).strip()
-
-        # Must contain letters
-        if not re.search(r'[A-Za-z]{2,}', full_text):
-            i = j
-            continue
-
-        lower = full_text.lower()
-        # Accept any text with 3+ letters (keyword filter was too aggressive)
-        if len(re.sub(r'[^a-zA-Z]', '', full_text)) < 3:
-            i = j
-            continue
-
-        # Skip if it's clearly the title/annotation
-        if any(skip in lower for skip in ['floor plan', 'copyright', 'scale', 'north']):
-            i = j
-            continue
-
-        # Convert bbox to original image coords
-        orig_bx = int(bx / scale)
-        orig_by = int(by / scale)
-        orig_bw = max(1, int(bw / scale))
-        orig_bh = max(1, int(bh / scale))
-        cx = orig_bx + orig_bw // 2
-        cy = orig_by + orig_bh // 2
-
-        candidates.append({
-            "text": full_text,
-            "cx": cx, "cy": cy,
-            "bx": orig_bx, "by": orig_by,
-            "bw": orig_bw, "bh": orig_bh,
-            "conf": int(np.mean(phrase_confs)),
-        })
-        i = j
-
-    rooms = _dedup_text_boxes(candidates)
-    log.info(f"  OCR found {len(rooms)} room labels")
-    for r in rooms:
-        log.info(f"    '{r['text']}' at ({r['cx']}, {r['cy']})")
-    return rooms
-
-
-def _dedup_text_boxes(rooms: list) -> list:
-    """Remove text detections whose centers are very close together."""
-    unique = []
-    for r in rooms:
-        if not any(abs(r['cx']-u['cx']) < 30 and abs(r['cy']-u['cy']) < 20
-                   for u in unique):
-            unique.append(r)
-    return unique
-
-
-# ── 3. Build room boxes from OCR positions + wall network ─────────────────────
-
-def build_room_boxes(ocr_rooms: list, wall_segs: list,
-                     h: int, w: int, project_id: str) -> list:
-    """
-    For each OCR-detected room label:
-    1. Start from the text center point
-    2. Expand outward in all 4 directions until we hit a wall segment
-    3. That gives us the room's bounding box
-
-    Falls back to a box around the text label if wall expansion fails.
-    """
-    if not ocr_rooms:
-        return []
-
-    # Build a wall raster for boundary checking
-    wall_raster = _rasterise_walls(wall_segs, h, w)
-
-    result = []
-    used_names: dict = {}
-
-    for idx, room in enumerate(ocr_rooms):
-        cx, cy = room['cx'], room['cy']
-
-        # Expand from center outward until hitting a wall
-        # Search in each direction with step size 1px
-        left   = _expand(wall_raster, cx, cy, h, w, "left")
-        right  = _expand(wall_raster, cx, cy, h, w, "right")
-        top    = _expand(wall_raster, cx, cy, h, w, "up")
-        bottom = _expand(wall_raster, cx, cy, h, w, "down")
-
-        # Clamp to image bounds with margin
-        margin = max(5, min(w, h) // 40)
-        left   = max(margin, left)
-        right  = min(w - margin, right)
-        top    = max(margin, top)
-        bottom = min(h - margin, bottom)
-
-        bw = right - left
-        bh = bottom - top
-
-        # Sanity check — must be a reasonable room size
-        min_dim = min(w, h) * 0.03
-        if bw < min_dim or bh < min_dim:
-            # Fall back to a box around the text label
-            pad = max(20, min(w, h) // 15)
-            left   = max(margin, cx - pad)
-            right  = min(w - margin, cx + pad)
-            top    = max(margin, cy - pad)
-            bottom = min(h - margin, cy + pad)
-            bw = right - left
-            bh = bottom - top
-
-        # Normalize name
-        name = " ".join(word.capitalize() for word in room['text'].split())
-        base = name
-        if base in used_names:
-            used_names[base] += 1
-            name = f"{base} {used_names[base]}"
-        else:
-            used_names[base] = 1
-
-        result.append({
-            "id":         f"{project_id}-r{idx+1}",
-            "name":       name,
-            "confidence": min(95, room['conf']),
-            "color":      room_color(name, idx),
-            "box": {
-                "top":    round(top  / h * 100, 3),
-                "left":   round(left / w * 100, 3),
-                "width":  round(bw   / w * 100, 3),
-                "height": round(bh   / h * 100, 3),
-            },
-        })
-
-    log.info(f"  Rooms built: {len(result)}")
-    return result
-
-
-def _rasterise_walls(wall_segs: list, h: int, w: int) -> np.ndarray:
-    """Draw wall segments onto a blank canvas for boundary checking."""
-    canvas = np.zeros((h, w), np.uint8)
-    for seg in wall_segs:
-        x1 = int(seg["x1"] / 100 * w)
-        y1 = int(seg["y1"] / 100 * h)
-        x2 = int(seg["x2"] / 100 * w)
-        y2 = int(seg["y2"] / 100 * h)
-        # Draw wall with thickness proportional to its detected thickness
-        thick = max(2, int(seg.get("thickness", 0.5) / 100 * max(w, h)))
-        cv2.line(canvas, (x1, y1), (x2, y2), 255, thick)
-    # Also dilate slightly to close tiny gaps
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    canvas = cv2.dilate(canvas, k)
-    return canvas
-
-
-def _expand(raster: np.ndarray, cx: int, cy: int,
-            h: int, w: int, direction: str) -> int:
-    """Walk from (cx,cy) in given direction until hitting a wall pixel."""
-    MAX_STEPS = max(w, h)  # safety limit
-    x, y = cx, cy
-    for _ in range(MAX_STEPS):
-        if direction == "left":
-            x -= 1
-            if x < 0 or raster[max(0,min(h-1,y)), x] > 128:
-                return x + 1
-        elif direction == "right":
-            x += 1
-            if x >= w or raster[max(0,min(h-1,y)), x] > 128:
-                return x - 1
-        elif direction == "up":
-            y -= 1
-            if y < 0 or raster[y, max(0,min(w-1,x))] > 128:
-                return y + 1
-        elif direction == "down":
-            y += 1
-            if y >= h or raster[y, max(0,min(w-1,x))] > 128:
-                return y - 1
-    return x if direction in ("left", "right") else y
-
-
-# ── 4. Wall detection ─────────────────────────────────────────────────────────
-
-def detect_walls(wall_mask, h: int, w: int) -> list:
+def detect_walls_cv(wall_mask, h: int, w: int) -> list:
+    """Detect wall line segments using Hough transform."""
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
     min_len = max(w, h) * 0.025
     raw = cv2.HoughLinesP(edges, 1, np.pi/180, 30,
@@ -426,13 +207,178 @@ def _dedup_walls(walls: list) -> list:
             else:  merged.append({"x1":avg,"y1":mn,"x2":avg,"y2":mx,"thickness":tk})
     return merged
 
+# ── 4. OpenCV room region detection ──────────────────────────────────────────
 
-# ── 5. Opening detection ──────────────────────────────────────────────────────
+def detect_room_regions(wall_mask, h: int, w: int) -> list:
+    """
+    Find enclosed room regions using distance transform.
+    This correctly separates adjacent rooms even with thin shared walls.
+    """
+    min_area = w * h * 0.002
+    max_area = w * h * 0.55
+    best_regions = []
+
+    # Try distance transform first (best for separating adjacent rooms)
+    k_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    sealed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k_small)
+    floor = cv2.bitwise_not(sealed)
+    margin = max(5, min(w,h)//40)
+    floor[:margin,:]=0; floor[-margin:,:]=0
+    floor[:,:margin]=0; floor[:,-margin:]=0
+
+    dist = cv2.distanceTransform(floor, cv2.DIST_L2, 5)
+    cv2.normalize(dist, dist, 0, 1.0, cv2.NORM_MINMAX)
+    _, sure_fg = cv2.threshold(dist, 0.12, 1.0, cv2.THRESH_BINARY)
+    sure_fg = np.uint8(sure_fg * 255)
+
+    n, _, stats, centroids = cv2.connectedComponentsWithStats(sure_fg, 8)
+    for lbl in range(1, n):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area < min_area or area > max_area: continue
+        x  = stats[lbl, cv2.CC_STAT_LEFT]
+        y  = stats[lbl, cv2.CC_STAT_TOP]
+        bw = stats[lbl, cv2.CC_STAT_WIDTH]
+        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+        if bw < 5 or bh < 5: continue
+        best_regions.append({
+            "box": {
+                "top":    round(y/h*100, 3),
+                "left":   round(x/w*100, 3),
+                "width":  round(bw/w*100, 3),
+                "height": round(bh/h*100, 3),
+            },
+            "area_px":    int(area),
+            "centroid_x": float(centroids[lbl][0]),
+            "centroid_y": float(centroids[lbl][1]),
+        })
+
+    # If distance transform gave too few, try progressive flood-fill
+    if len(best_regions) < 3:
+        for ksize in [5, 9, 13, 19]:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+            closed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k)
+            fl = cv2.bitwise_not(closed)
+            fl[:margin,:]=0; fl[-margin:,:]=0; fl[:,:margin]=0; fl[:,-margin:]=0
+            n2, _, stats2, cent2 = cv2.connectedComponentsWithStats(fl, 8)
+            regions = []
+            for lbl in range(1, n2):
+                area = stats2[lbl, cv2.CC_STAT_AREA]
+                if area < min_area or area > max_area: continue
+                x  = stats2[lbl, cv2.CC_STAT_LEFT]
+                y  = stats2[lbl, cv2.CC_STAT_TOP]
+                bw = stats2[lbl, cv2.CC_STAT_WIDTH]
+                bh = stats2[lbl, cv2.CC_STAT_HEIGHT]
+                if max(bw,bh)/max(min(bw,bh),1) > 12: continue
+                regions.append({
+                    "box": {
+                        "top":    round(y/h*100, 3),
+                        "left":   round(x/w*100, 3),
+                        "width":  round(bw/w*100, 3),
+                        "height": round(bh/h*100, 3),
+                    },
+                    "area_px":    int(area),
+                    "centroid_x": float(cent2[lbl][0]),
+                    "centroid_y": float(cent2[lbl][1]),
+                })
+            if len(regions) > len(best_regions):
+                best_regions = regions
+            if len(regions) >= 4:
+                break
+
+    best_regions.sort(key=lambda r: r["area_px"], reverse=True)
+    log.info(f"  Room regions: {len(best_regions)}")
+    return best_regions[:15]
+
+# ── 5. Match Gemini names to OpenCV regions ───────────────────────────────────
+
+def match_names_to_regions(
+    gemini_rooms: list,
+    cv_regions: list,
+    image_w: int,
+    image_h: int,
+    project_id: str,
+) -> list:
+    """
+    Gemini gives room names + approximate box_2d positions.
+    OpenCV gives exact region bounding boxes.
+    Match by centroid distance. Use OpenCV box for precision.
+    If no OpenCV regions, fall back to Gemini box directly.
+    """
+    FT_TO_M = 0.3048
+    used: set = set()
+    result = []
+
+    for idx, g in enumerate(gemini_rooms):
+        # Gemini centroid in pixel coords
+        if g.get("box_2d") and len(g["box_2d"]) == 4:
+            ymin, xmin, ymax, xmax = g["box_2d"]
+            gcx = ((xmin+xmax)/2/1000) * image_w
+            gcy = ((ymin+ymax)/2/1000) * image_h
+        else:
+            gcx, gcy = image_w/2, image_h/2
+
+        # Find nearest unused OpenCV region
+        best_i, best_d = -1, float("inf")
+        for ri, reg in enumerate(cv_regions):
+            if ri in used: continue
+            d = np.hypot(reg["centroid_x"]-gcx, reg["centroid_y"]-gcy)
+            if d < best_d:
+                best_d, best_i = d, ri
+
+        if best_i >= 0:
+            box = cv_regions[best_i]["box"]
+            used.add(best_i)
+        elif g.get("box_2d") and len(g["box_2d"]) == 4:
+            ymin, xmin, ymax, xmax = g["box_2d"]
+            box = {
+                "top":    max(0, min(100, ymin/10)),
+                "left":   max(0, min(100, xmin/10)),
+                "width":  max(0, min(100, (xmax-xmin)/10)),
+                "height": max(0, min(100, (ymax-ymin)/10)),
+            }
+        else:
+            continue
+
+        # Extract dimensions
+        dims = g.get("dimensions")
+        length = width = None
+        if dims and dims.get("length") and dims.get("width"):
+            factor = FT_TO_M if dims.get("unit") == "ft" else 1
+            length = round(dims["length"] * factor, 2)
+            width  = round(dims["width"]  * factor, 2)
+
+        name = g.get("name", f"Room {idx+1}")
+        result.append({
+            "id":         f"{project_id}-r{idx+1}",
+            "name":       name,
+            "confidence": int(g.get("confidence", 70)),
+            "color":      room_color(name, idx),
+            "box":        box,
+            "length":     length,
+            "width":      width,
+        })
+
+    # Add any unmatched OpenCV regions as unnamed rooms
+    for ri, reg in enumerate(cv_regions):
+        if ri in used: continue
+        idx = len(result)
+        name = f"Room {idx+1}"
+        result.append({
+            "id":         f"{project_id}-r{idx+1}",
+            "name":       name,
+            "confidence": 50,
+            "color":      room_color(name, idx),
+            "box":        reg["box"],
+        })
+
+    return result
+
+# ── 6. Opening detection ──────────────────────────────────────────────────────
 
 def detect_openings(wall_mask, h: int, w: int) -> list:
     openings = []
 
-    # Doors — Hough circles (arc symbols)
+    # Doors — arc detection (door swing symbols are quarter-circles)
     blurred = cv2.GaussianBlur(wall_mask, (5,5), 0)
     circles = cv2.HoughCircles(
         blurred, cv2.HOUGH_GRADIENT, dp=1.2,
@@ -445,8 +391,7 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
         for cx, cy, r in np.round(circles[0]).astype(int):
             x0,y0 = max(0,cx-r-4), max(0,cy-r-4)
             x1b,y1b = min(w,cx+r+4), min(h,cy+r+4)
-            if float(np.mean(wall_mask[y0:y1b,x0:x1b]>128)) < 0.10:
-                continue
+            if float(np.mean(wall_mask[y0:y1b,x0:x1b]>128)) < 0.10: continue
             hd = float(np.mean(wall_mask[max(0,cy-3):min(h,cy+3),max(0,cx-r):min(w,cx+r)]>128))
             vd = float(np.mean(wall_mask[max(0,cy-r):min(h,cy+r),max(0,cx-3):min(w,cx+3)]>128))
             openings.append({
@@ -457,11 +402,10 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
                 "width": max(80.0, round(r*2/max(w,h)*1000, 2)),
             })
 
-    # Windows — short parallel line segments directly on walls
-    # Only look on the outer wall boundary (exterior windows)
+    # Windows — thin parallel segments crossing walls
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
     min_win = max(12, min(w,h)//35)
-    max_win = max(w,h)//12  # stricter max
+    max_win = max(w,h)//12
 
     for kern, orient in [
         (cv2.getStructuringElement(cv2.MORPH_RECT, (min_win,1)), "horizontal"),
@@ -472,12 +416,11 @@ def detect_openings(wall_mask, h: int, w: int) -> list:
         for lbl in range(1, n):
             seg_w = st[lbl,cv2.CC_STAT_WIDTH]
             seg_h = st[lbl,cv2.CC_STAT_HEIGHT]
-            seg_len = seg_w if orient=="horizontal" else seg_h
+            seg_len  = seg_w if orient=="horizontal" else seg_h
             seg_perp = seg_h if orient=="horizontal" else seg_w
             if seg_len < min_win or seg_len > max_win: continue
+            if seg_perp > min_win * 2: continue  # must be thin symbol
             if st[lbl,cv2.CC_STAT_AREA] < 20: continue
-            # Window symbol is thin in the perpendicular direction
-            if seg_perp > min_win * 2: continue
             icx,icy = int(ct[lbl][0]), int(ct[lbl][1])
             roi = wall_mask[max(0,icy-4):min(h,icy+4), max(0,icx-4):min(w,icx+4)]
             if roi.max() < 128: continue
@@ -502,48 +445,6 @@ def _dedup_openings(openings: list) -> list:
             unique.append(op)
     return unique
 
-
-def _flood_fill_rooms(wall_mask, h: int, w: int) -> list:
-    """Flood-fill fallback: tries multiple kernel sizes to find enclosed regions."""
-    min_area = w * h * 0.002
-    max_area = w * h * 0.55
-    best = []
-    for ksize in [3, 5, 7, 9, 11, 15]:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
-        closed = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, k)
-        floor = cv2.bitwise_not(closed)
-        margin = max(5, min(w,h)//40)
-        floor[:margin,:]=0; floor[-margin:,:]=0
-        floor[:,:margin]=0; floor[:,-margin:]=0
-        n, _, stats, centroids = cv2.connectedComponentsWithStats(floor, 8)
-        regions = []
-        for lbl in range(1, n):
-            area = stats[lbl, cv2.CC_STAT_AREA]
-            if area < min_area or area > max_area: continue
-            x  = stats[lbl, cv2.CC_STAT_LEFT]
-            y  = stats[lbl, cv2.CC_STAT_TOP]
-            bw = stats[lbl, cv2.CC_STAT_WIDTH]
-            bh = stats[lbl, cv2.CC_STAT_HEIGHT]
-            if max(bw,bh)/max(min(bw,bh),1) > 12: continue
-            regions.append({
-                "box": {
-                    "top":    round(y/h*100, 3),
-                    "left":   round(x/w*100, 3),
-                    "width":  round(bw/w*100, 3),
-                    "height": round(bh/h*100, 3),
-                },
-                "area_px":    int(area),
-                "centroid_x": float(centroids[lbl][0]),
-                "centroid_y": float(centroids[lbl][1]),
-            })
-        if len(regions) > len(best):
-            best = regions
-        if len(regions) >= 4:
-            break
-    best.sort(key=lambda r: r["area_px"], reverse=True)
-    return best[:15]
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(
@@ -552,59 +453,23 @@ async def analyse_floor_plan(
     project_id: str,
     gemini_api_key: str = "",
 ) -> dict:
-    bgr, wall_mask, grey, h, w = preprocess(image_bytes)
+    bgr, wall_mask, h, w = preprocess(image_bytes)
     log.info(f"Image: {w}×{h}px  project={project_id}")
 
-    # Walls first — needed for room box expansion
-    walls     = detect_walls(wall_mask, h, w)
+    # Step 1: Walls (OpenCV Hough)
+    walls = detect_walls_cv(wall_mask, h, w)
 
-    # OCR to find room labels and their positions
-    ocr_rooms = ocr_find_rooms(grey, h, w)
+    # Step 2: Room regions (OpenCV geometry — pixel accurate)
+    cv_regions = detect_room_regions(wall_mask, h, w)
 
-    # If OCR found fewer than 3 rooms, supplement with flood-fill region detection
-    # This handles cases where Tesseract can't read the floor plan text
-    if len(ocr_rooms) < 3:
-        log.info(f"  OCR found only {len(ocr_rooms)} rooms — running flood-fill fallback")
-        flood_regions = _flood_fill_rooms(wall_mask, h, w)
-        if flood_regions:
-            # Build rooms from flood-fill regions, name them generically
-            fallback_rooms = []
-            for i, reg in enumerate(flood_regions):
-                fallback_rooms.append({
-                    "id":         f"{project_id}-r{i+1}",
-                    "name":       f"Room {i+1}",
-                    "confidence": 50,
-                    "color":      FALLBACK_COLORS[i % len(FALLBACK_COLORS)],
-                    "box":        reg["box"],
-                })
-            # Merge: use OCR rooms for named ones, flood-fill for the rest
-            # Replace flood rooms with OCR rooms where positions match
-            ocr_built = build_room_boxes(ocr_rooms, walls, h, w, project_id)
-            # Start with flood-fill, overlay OCR names where centroids match
-            for ocr_r in ocr_built:
-                # Find closest flood-fill room
-                ocr_cx = (ocr_r["box"]["left"] + ocr_r["box"]["width"]/2)
-                ocr_cy = (ocr_r["box"]["top"] + ocr_r["box"]["height"]/2)
-                best_i, best_d = -1, float("inf")
-                for fi, fr in enumerate(fallback_rooms):
-                    fc_x = fr["box"]["left"] + fr["box"]["width"]/2
-                    fc_y = fr["box"]["top"]  + fr["box"]["height"]/2
-                    d = ((ocr_cx-fc_x)**2 + (ocr_cy-fc_y)**2)**0.5
-                    if d < best_d:
-                        best_d, best_i = d, fi
-                if best_i >= 0 and best_d < 30:
-                    fallback_rooms[best_i]["name"]  = ocr_r["name"]
-                    fallback_rooms[best_i]["color"] = ocr_r["color"]
-                    fallback_rooms[best_i]["confidence"] = ocr_r["confidence"]
-            rooms = fallback_rooms
-        else:
-            rooms = build_room_boxes(ocr_rooms, walls, h, w, project_id)
-    else:
-        # Build room boxes by expanding from OCR text positions until hitting walls
-        rooms = build_room_boxes(ocr_rooms, walls, h, w, project_id)
+    # Step 3: Room names + dimensions (Gemini — text reading only)
+    gemini_rooms = await gemini_name_rooms(image_url, gemini_api_key)
 
-    # Openings
-    openings  = detect_openings(wall_mask, h, w)
+    # Step 4: Match names to regions
+    rooms = match_names_to_regions(gemini_rooms, cv_regions, w, h, project_id)
+
+    # Step 5: Openings (OpenCV)
+    openings = detect_openings(wall_mask, h, w)
 
     return {
         "rooms":      rooms,
