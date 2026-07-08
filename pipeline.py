@@ -76,7 +76,10 @@ async def gemini_name_rooms(image_url: str, gemini_key: str) -> list:
     Returns list of {name, confidence, box_2d, dimensions}.
     """
     if not gemini_key:
+        log.warning("  Gemini: no API key provided - check GEMINI_API_KEY env var")
         return []
+
+    log.info(f"  Gemini: calling API (key ends ...{gemini_key[-4:]})")
 
     prompt = """You are reading a floor plan image.
 
@@ -124,8 +127,9 @@ Return ONLY the JSON array."""
             log.info(f"  Gemini: {len(arr)} rooms named")
             return arr
         except Exception as e:
-            log.error(f"Gemini attempt {attempt+1}: {e}")
+            log.error(f"Gemini attempt {attempt+1} failed: {type(e).__name__}: {e}")
             await asyncio.sleep(3)
+    log.error("  Gemini: all attempts failed, returning 0 rooms")
     return []
 
 def _parse_json_array(text: str) -> list:
