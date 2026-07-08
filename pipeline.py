@@ -228,10 +228,16 @@ def detect_room_regions(wall_mask, h: int, w: int) -> list:
 
     dist = cv2.distanceTransform(floor, cv2.DIST_L2, 5)
     cv2.normalize(dist, dist, 0, 1.0, cv2.NORM_MINMAX)
-    _, sure_fg = cv2.threshold(dist, 0.12, 1.0, cv2.THRESH_BINARY)
+    _, sure_fg = cv2.threshold(dist, 0.05, 1.0, cv2.THRESH_BINARY)
     sure_fg = np.uint8(sure_fg * 255)
 
     n, _, stats, centroids = cv2.connectedComponentsWithStats(sure_fg, 8)
+    log.info(f"  Distance transform: {n-1} components, min_area={int(min_area)}, max_area={int(max_area)}")
+    for lbl in range(1, min(n, 20)):
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        bw = stats[lbl, cv2.CC_STAT_WIDTH]
+        bh = stats[lbl, cv2.CC_STAT_HEIGHT]
+        log.info(f"    component {lbl}: area={area} bw={bw} bh={bh} {'OK' if min_area<area<max_area else 'SKIP'}")
     for lbl in range(1, n):
         area = stats[lbl, cv2.CC_STAT_AREA]
         if area < min_area or area > max_area: continue
@@ -459,13 +465,14 @@ async def analyse_floor_plan(
     # Step 1: Walls (OpenCV Hough)
     walls = detect_walls_cv(wall_mask, h, w)
 
-    # Step 2: Room regions (OpenCV geometry — pixel accurate)
-    cv_regions = detect_room_regions(wall_mask, h, w)
-
-    # Step 3: Room names + dimensions (Gemini — text reading only)
+    # Step 2: Room names + dimensions (Gemini — always called)
     gemini_rooms = await gemini_name_rooms(image_url, gemini_api_key)
 
-    # Step 4: Match names to regions
+    # Step 3: Room regions (OpenCV geometry)
+    cv_regions = detect_room_regions(wall_mask, h, w)
+
+    # Step 4: Match — if OpenCV found regions, use them for precise boxes
+    # If OpenCV found nothing, use Gemini's box_2d directly
     rooms = match_names_to_regions(gemini_rooms, cv_regions, w, h, project_id)
 
     # Step 5: Openings (OpenCV)
