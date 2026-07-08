@@ -1,4 +1,7 @@
-
+"""
+Nooi Floor Plan Analysis Service
+No AI APIs — pure OpenCV + Tesseract OCR.
+"""
 import logging, os, traceback
 from typing import Optional
 import httpx
@@ -48,6 +51,7 @@ async def analyse(req: AnalyseRequest):
             image_bytes=image_bytes,
             image_url=req.image_url,
             project_id=req.project_id,
+            gemini_api_key=req.gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
         )
         log.info(f"Done: {len(result['rooms'])} rooms, {len(result['walls'])} walls, {len(result['openings'])} openings")
         return AnalyseResponse(success=True, **result)
