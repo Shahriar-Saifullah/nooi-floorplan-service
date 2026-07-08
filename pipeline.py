@@ -207,7 +207,45 @@ def _dedup_walls(walls: list) -> list:
             else:  merged.append({"x1":avg,"y1":mn,"x2":avg,"y2":mx,"thickness":tk})
     return merged
 
-# ── 4. OpenCV room region detection ──────────────────────────────────────────
+def _gemini_rooms_to_result(gemini_rooms: list, image_w: int, image_h: int, project_id: str) -> list:
+    """Convert Gemini room data directly to room list using Gemini's box_2d positions."""
+    FT_TO_M = 0.3048
+    result = []
+    for idx, g in enumerate(gemini_rooms):
+        box = None
+        if g.get("box_2d") and len(g["box_2d"]) == 4:
+            ymin, xmin, ymax, xmax = g["box_2d"]
+            box = {
+                "top":    round(max(0, min(100, ymin / 10)), 3),
+                "left":   round(max(0, min(100, xmin / 10)), 3),
+                "width":  round(max(0, min(100, (xmax - xmin) / 10)), 3),
+                "height": round(max(0, min(100, (ymax - ymin) / 10)), 3),
+            }
+        if not box:
+            continue
+
+        dims = g.get("dimensions")
+        length = width = None
+        if dims and dims.get("length") and dims.get("width"):
+            factor = FT_TO_M if dims.get("unit") == "ft" else 1
+            length = round(float(dims["length"]) * factor, 2)
+            width  = round(float(dims["width"])  * factor, 2)
+
+        name = g.get("name", f"Room {idx+1}")
+        result.append({
+            "id":         f"{project_id}-r{idx+1}",
+            "name":       name,
+            "confidence": int(g.get("confidence", 70)),
+            "color":      room_color(name, idx),
+            "box":        box,
+            "length":     length,
+            "width":      width,
+        })
+    log.info(f"  Rooms from Gemini: {len(result)}")
+    return result
+
+
+# ── 4. OpenCV room region detection (kept for future use) ─────────────────────
 
 def detect_room_regions(wall_mask, h: int, w: int) -> list:
     """
@@ -465,15 +503,15 @@ async def analyse_floor_plan(
     # Step 1: Walls (OpenCV Hough)
     walls = detect_walls_cv(wall_mask, h, w)
 
-    # Step 2: Room names + dimensions (Gemini — always called)
+    # Step 2: Room names + positions from Gemini
+    # Gemini reads the floor plan image and returns room names with approximate
+    # bounding box positions (box_2d). These are used directly for the 2D overlay.
+    # OpenCV room region detection is skipped — it cannot reliably find enclosed
+    # regions from JPEG floor plan images with thin walls and text content.
     gemini_rooms = await gemini_name_rooms(image_url, gemini_api_key)
 
-    # Step 3: Room regions (OpenCV geometry)
-    cv_regions = detect_room_regions(wall_mask, h, w)
-
-    # Step 4: Match — if OpenCV found regions, use them for precise boxes
-    # If OpenCV found nothing, use Gemini's box_2d directly
-    rooms = match_names_to_regions(gemini_rooms, cv_regions, w, h, project_id)
+    # Step 3: Build room list from Gemini data directly
+    rooms = _gemini_rooms_to_result(gemini_rooms, w, h, project_id)
 
     # Step 5: Openings (OpenCV)
     openings = detect_openings(wall_mask, h, w)
