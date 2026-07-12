@@ -48,7 +48,7 @@ def _check_image_url(url: str) -> None:
 class AnalyseRequest(BaseModel):
     image_url: str
     project_id: str
-    gemini_api_key: Optional[str] = None   # legacy field, ignored
+    gemini_api_key: Optional[str] = None   # used for the dimension fallback
 
 
 class AnalyseResponse(BaseModel):
@@ -89,6 +89,8 @@ async def analyse(req: AnalyseRequest,
             image_bytes=image_bytes,
             image_url=req.image_url,
             project_id=req.project_id,
+            gemini_api_key=req.gemini_api_key
+                or os.getenv("GEMINI_API_KEY", ""),
         )
         log.info(f"Done: {len(result['rooms'])} rooms, "
                  f"{len(result['walls'])} walls, "

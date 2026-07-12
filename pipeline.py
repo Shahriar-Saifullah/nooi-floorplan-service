@@ -341,7 +341,8 @@ def diagonal_walls(barrier, thickness: int, h: int, w: int) -> list:
     return out
 
 
-def segment_rooms(seal, wall_mask, ink_clean, thickness: int, h: int, w: int):
+def segment_rooms(seal, wall_mask, ink_clean, label_points: list,
+                  thickness: int, h: int, w: int):
     """
     1. free space = NOT seal (seal already has door gaps bridged by vectors)
     2. multi-scale EROSION of free space: doorways are narrow, rooms are wide,
@@ -446,19 +447,43 @@ def segment_rooms(seal, wall_mask, ink_clean, thickness: int, h: int, w: int):
         labels[lblL == i] = n_rooms
 
     labels[seal > 0] = 0
-    labels = _merge_unwalled(labels, n_rooms, wall_mask, ink_clean, footprint, thickness, h, w)
+    labels = _merge_unwalled(labels, n_rooms, wall_mask, ink_clean, footprint,
+                             label_points, thickness, h, w)
     n_rooms = int(labels.max())
     log.info(f"  Rooms segmented: {n_rooms}")
     return labels, n_rooms, footprint
 
 
 def _merge_unwalled(labels, n: int, wall_mask, ink_clean, footprint,
-                    thickness: int, h: int, w: int):
+                    label_points: list, thickness: int, h: int, w: int):
     """Merge adjacent regions whose shared boundary has almost no true wall
     pixels — split by furniture lines or seal bridges, not real walls.
     EXCEPTION: at the building footprint edge, thin ink (window glazing,
     slider dashes) is a real indoor/outdoor divider — those stay separate.
     Interior furniture ink never blocks a merge."""
+    # Which regions own a room-name label? A labelled region is a room the
+    # architect named — it must NEVER merge with another labelled region,
+    # even across a pure open-plan pass-through (Kitchen / Dining / Great
+    # Room stay three rooms; the 3D still builds no wall between them
+    # because only real wall pixels become walls).
+    def _region_at(cx: int, cy: int) -> int:
+        rid = int(labels[cy, cx]) if 0 <= cy < h and 0 <= cx < w else 0
+        if rid:
+            return rid
+        for r in range(3, 22, 3):
+            for dx, dy in ((r, 0), (-r, 0), (0, r), (0, -r),
+                           (r, r), (-r, -r), (r, -r), (-r, r)):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < h and labels[y, x]:
+                    return int(labels[y, x])
+        return 0
+
+    labelled: dict = {}
+    for (lx, ly) in label_points:
+        rid = _region_at(int(lx), int(ly))
+        if rid:
+            labelled[rid] = labelled.get(rid, 0) + 1
+
     wall_band = cv2.dilate(wall_mask, cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (thickness | 1, thickness | 1)))
     ink_band = cv2.dilate(ink_clean, cv2.getStructuringElement(
@@ -473,10 +498,18 @@ def _merge_unwalled(labels, n: int, wall_mask, ink_clean, footprint,
             parent[a] = parent[parent[a]]
             a = parent[a]
         return a
+    root_labels = {rid: labelled.get(rid, 0) for rid in range(1, n + 1)}
+
     def union(a, b):
         ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
+        if ra == rb:
+            return
+        # transitive-safe: if BOTH groups already contain a named room,
+        # keep them apart (an unlabelled fragment can join either side)
+        if root_labels.get(ra, 0) and root_labels.get(rb, 0):
+            return
+        parent[rb] = ra
+        root_labels[ra] = root_labels.get(ra, 0) + root_labels.get(rb, 0)
 
     # Examine the SEPARATOR pixels between each adjacent pair and classify
     # what the drawing actually put there:
@@ -1082,18 +1115,17 @@ def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
     free = (barrier == 0).astype(np.uint8) * 255
 
     out = []
+    # Pass 1: collect usable outdoor label seeds
+    seeds = []
     for ph in phrases:
         name = _lexicon_match(ph["text"])
         if not name or name not in _OUTDOOR_NAMES:
             continue
         cx, cy = int(ph["cx"]), int(ph["cy"])
-        # skip if the label already sits inside a detected room
-        inside = any(cv2.pointPolygonTest(
-            p["pts"].astype(np.float32).reshape(-1, 1, 2),
-            (float(cx), float(cy)), False) >= 0 for p in polys)
-        if inside:
+        if any(cv2.pointPolygonTest(
+                p["pts"].astype(np.float32).reshape(-1, 1, 2),
+                (float(cx), float(cy)), False) >= 0 for p in polys):
             continue
-        # nudge the seed off barrier pixels if needed
         seed = None
         for r in range(0, 25, 3):
             for dx, dy in ((0, 0), (r, 0), (-r, 0), (0, r), (0, -r)):
@@ -1103,16 +1135,41 @@ def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
                     break
             if seed:
                 break
-        if not seed:
-            continue
+        if seed:
+            seeds.append({"name": name, "cx": cx, "cy": cy, "seed": seed,
+                          "conf": ph["conf"]})
+
+    if not seeds:
+        log.info("  Outdoor areas: 0 (none)")
+        return out
+
+    # Pass 2: flood the outdoor space once per seed, then split shared
+    # ground by NEAREST label (several labels usually share one connected
+    # outdoor area — patio, porch, covered porch wrap around the house)
+    flooded = np.zeros((h, w), np.uint8)
+    for s in seeds:
         ff = free.copy()
         mask = np.zeros((h + 2, w + 2), np.uint8)
-        cv2.floodFill(ff, mask, seed, 128)
-        region = (ff == 128).astype(np.uint8) * 255
+        cv2.floodFill(ff, mask, s["seed"], 128)
+        flooded |= (ff == 128).astype(np.uint8)
+
+    ys_f, xs_f = np.nonzero(flooded)
+    if ys_f.size == 0:
+        log.info("  Outdoor areas: 0 (none)")
+        return out
+    d2 = np.stack([(xs_f - s["cx"]) ** 2 + (ys_f - s["cy"]) ** 2
+                   for s in seeds])           # (n_seeds, n_pixels)
+    owner = np.argmin(d2, axis=0)
+
+    for si, s in enumerate(seeds):
+        region = np.zeros((h, w), np.uint8)
+        sel = owner == si
+        region[ys_f[sel], xs_f[sel]] = 255
         # clip to a window around the label to stop border creep
         win = np.zeros((h, w), np.uint8)
         hw, hh = int(w * 0.34), int(h * 0.34)
-        win[max(0, cy - hh):min(h, cy + hh), max(0, cx - hw):min(w, cx + hw)] = 255
+        win[max(0, s["cy"] - hh):min(h, s["cy"] + hh),
+            max(0, s["cx"] - hw):min(w, s["cx"] + hw)] = 255
         region = cv2.bitwise_and(region, win)
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE,
                                   cv2.getStructuringElement(
@@ -1120,8 +1177,8 @@ def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
         n, lbl, stats, _ = cv2.connectedComponentsWithStats(region, 8)
         if n <= 1:
             continue
-        # component containing (or nearest to) the seed
-        sid = lbl[seed[1], seed[0]]
+        sx, sy = s["seed"]
+        sid = lbl[sy, sx]
         if sid == 0:
             sid = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         comp = (lbl == sid).astype(np.uint8) * 255
@@ -1137,27 +1194,120 @@ def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
         if len(approx) < 3:
             continue
         pts = _snap_rectilinear(approx)
-        pretty = " ".join(wd.capitalize() for wd in name.split())
-        # dedupe overlapping outdoor regions (e.g. two PORCH labels)
-        c_new = pts.mean(axis=0)
-        if any(np.hypot(*(c_new - o["centroid"])) < min(h, w) * 0.12
-               for o in out):
-            continue
+        pretty = " ".join(wd.capitalize() for wd in s["name"].split())
         out.append({"pts": pts,
                     "area_px": float(cv2.contourArea(cnt)),
-                    "centroid": c_new,
+                    "centroid": pts.mean(axis=0),
                     "names": [], "name": pretty,
-                    "conf": min(90, ph["conf"]),
+                    "conf": min(90, s["conf"]),
                     "outdoor": True})
+
     log.info(f"  Outdoor areas: {len(out)} "
              f"({', '.join(o['name'] for o in out) or 'none'})")
     return out
 
 
+
+
+# ── 9d. Gemini dimension fallback (tiny/blurry dimension text) ────────────────
+# OCR engines fail below ~8px glyph height; vision LLMs read such text via
+# context priors. Used ONLY when Tesseract found no scale, and every value it
+# returns must still pass the same aspect-ratio validation — a hallucinated
+# digit fails the geometry check and is discarded.
+
+async def gemini_dimensions(image_bytes: bytes, polys: list,
+                            api_key: str) -> float | None:
+    if not api_key:
+        return None
+    try:
+        import httpx, base64, json as _json
+    except ImportError:
+        return None
+
+    room_names = [p["name"] for p in polys if p.get("name")]
+    prompt = (
+        "This is an architectural floor plan. Under each room label there is "
+        "usually a printed size like 14'-7\" X 16' (feet and inches). "
+        "Read them carefully. Return ONLY a JSON array, one item per room "
+        "you can read a size for: "
+        '[{"name":"<room label as printed>","feet_a":14,"inches_a":7,'
+        '"feet_b":16,"inches_b":0}]. '
+        "Use 0 for missing inches. Skip rooms whose size you cannot read. "
+        f"Known room labels: {', '.join(room_names[:20])}."
+    )
+    b64 = base64.b64encode(image_bytes).decode()
+    body = {
+        "contents": [{"parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": b64}},
+        ]}],
+        "generationConfig": {"responseMimeType": "application/json",
+                             "temperature": 0},
+    }
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           "gemini-2.5-flash:generateContent")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=body,
+                                  headers={"x-goog-api-key": api_key})
+            if r.status_code != 200:
+                log.warning(f"  Gemini dims: HTTP {r.status_code}")
+                return None
+            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            items = _json.loads(raw[raw.index("["):raw.rindex("]") + 1])
+    except Exception as e:
+        log.warning(f"  Gemini dims failed: {e}")
+        return None
+
+    FT, IN = 0.3048, 0.0254
+    scale_votes: list[float] = []
+    accepted = 0
+    for it in items:
+        try:
+            a = float(it["feet_a"]) * FT + float(it.get("inches_a") or 0) * IN
+            b = float(it["feet_b"]) * FT + float(it.get("inches_b") or 0) * IN
+            gname = str(it["name"]).upper()
+        except Exception:
+            continue
+        if not (1.0 < a < 30 and 1.0 < b < 30):
+            continue
+        # fuzzy-match to a detected room
+        best_p, best_d = None, 10 ** 9
+        for p in polys:
+            if not p.get("name"):
+                continue
+            d = _lev(gname[:24], p["name"].upper()[:24])
+            if d < best_d:
+                best_d, best_p = d, p
+        if best_p is None or best_d > max(3, len(gname) // 3):
+            continue
+        xs = best_p["pts"][:, 0]; ys = best_p["pts"][:, 1]
+        px_w = float(xs.max() - xs.min()); px_h = float(ys.max() - ys.min())
+        ar_txt = max(a, b) / max(0.1, min(a, b))
+        ar_px = max(px_w, px_h) / max(1.0, min(px_w, px_h))
+        if abs(ar_txt - ar_px) / ar_px > 0.40:
+            continue                          # geometry disagrees: reject
+        if px_w >= px_h:
+            best_p["dim_w"], best_p["dim_l"] = max(a, b), min(a, b)
+        else:
+            best_p["dim_w"], best_p["dim_l"] = min(a, b), max(a, b)
+        accepted += 1
+        scale_votes.append(max(a, b) / max(px_w, px_h))
+        scale_votes.append(min(a, b) / min(px_w, px_h))
+
+    log.info(f"  Gemini dims: {len(items)} read, {accepted} passed validation")
+    if len(scale_votes) < 2:
+        return None
+    med = float(np.median(scale_votes))
+    good = [v for v in scale_votes if abs(v - med) / med < 0.30]
+    return float(np.median(good)) if len(good) >= 2 else None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
-                             project_id: str = "p", **_) -> dict:
+                             project_id: str = "p",
+                             gemini_api_key: str = "", **_) -> dict:
     bgr, grey, grey_orig, ink, h, w, ws = preprocess(image_bytes)
     log.info(f"Image: {w}x{h}px (work scale {ws:.2f})  project={project_id}")
 
@@ -1176,11 +1326,14 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
     diag = diagonal_walls(barrier, thickness, h, w)
     seal = build_seal(barrier, walls_px, thickness, h, w, diag)
 
+    phrases = build_phrases(words)
+    label_points = [(ph["cx"], ph["cy"]) for ph in phrases
+                    if _lexicon_match(ph["text"])]
+
     labels, n_rooms, footprint = segment_rooms(seal, wmask, ink_clean,
-                                                thickness, h, w)
+                                                label_points, thickness, h, w)
     polys = polygonize_rooms(labels, n_rooms, thickness, h, w)
 
-    phrases = build_phrases(words)
     assign_names(polys, phrases)
 
     # outdoor areas (patio / porch): label-seeded, added AFTER naming so
@@ -1194,6 +1347,9 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
     if not scale_m:
         dim_words = ocr_dimensions(grey_orig, ws)
         scale_m = calibrate_scale(words + dim_words, polys)
+    if not scale_m:
+        # OCR floor reached (tiny/blurry print) -> one Gemini read, validated
+        scale_m = await gemini_dimensions(image_bytes, polys, gemini_api_key)
     if scale_m:
         log.info(f"  Scale: {scale_m*1000:.2f} mm/px")
 
