@@ -449,7 +449,7 @@ def segment_rooms(seal, wall_mask, ink_clean, thickness: int, h: int, w: int):
     labels = _merge_unwalled(labels, n_rooms, wall_mask, ink_clean, footprint, thickness, h, w)
     n_rooms = int(labels.max())
     log.info(f"  Rooms segmented: {n_rooms}")
-    return labels, n_rooms
+    return labels, n_rooms, footprint
 
 
 def _merge_unwalled(labels, n: int, wall_mask, ink_clean, footprint,
@@ -646,8 +646,8 @@ def _lexicon_match(text: str):
     return best
 
 
-def assign_names(polys: list, words: list) -> None:
-    """Group OCR words into phrases, drop dimensions, assign by point-in-polygon."""
+def build_phrases(words: list) -> list:
+    """Group OCR words into label phrases (split on big horizontal gaps)."""
     # group words by (block, par, line)
     groups: dict = {}
     for wd in words:
@@ -682,6 +682,10 @@ def assign_names(polys: list, words: list) -> None:
             cy = int(np.mean([x["cy"] for x in kept]))
             conf = int(np.mean([x["conf"] for x in kept]))
             phrases.append({"text": text, "cx": cx, "cy": cy, "conf": conf})
+    return phrases
+
+
+def assign_names(polys: list, phrases: list) -> None:
 
     for p in polys:
         p["names"] = []
@@ -962,6 +966,194 @@ def calibrate_scale(words: list, polys: list) -> float | None:
     return scale
 
 
+
+
+# ── 9b. Per-room crop OCR: recover names + parse dimension strings ───────────
+
+_CROP_DIM = re.compile(
+    r"(\d{1,2})\s*[\'`\u2019]?\s*(?:[-\u2013\u2014]\s*(\d{1,2})\s*[\"\u201d]?)?"
+    r"\s*[xX\u00d7]\s*"
+    r"(\d{1,2})\s*[\'`\u2019]?\s*(?:[-\u2013\u2014]\s*(\d{1,2})\s*[\"\u201d]?)?")
+
+def recover_room_details(polys: list, grey_orig, work_scale: float,
+                         h: int, w: int) -> float | None:
+    """For every room, OCR a padded high-res crop of the ORIGINAL image:
+       - unnamed rooms get a second naming chance (lexicon-matched)
+       - dimension strings like 14'-7" x 16' become length/width in metres,
+         but ONLY if they pass validation (plausible size + aspect ratio
+         matching the room's pixel aspect) — a wrong number is worse than none
+       Returns the median metres-per-WORKING-pixel scale, or None."""
+    try:
+        import pytesseract
+    except ImportError:
+        return None
+    FT, IN = 0.3048, 0.0254
+    oh, ow = grey_orig.shape[:2]
+    scale_votes: list[float] = []
+
+    for p in polys:
+        xs = p["pts"][:, 0] / work_scale
+        ys = p["pts"][:, 1] / work_scale
+        px_w = float(xs.max() - xs.min())
+        px_h = float(ys.max() - ys.min())
+        padx, pady = int(px_w * 0.35), int(px_h * 0.35)
+        x0 = max(0, int(xs.min()) - padx); x1 = min(ow, int(xs.max()) + padx)
+        y0 = max(0, int(ys.min()) - pady); y1 = min(oh, int(ys.max()) + pady)
+        crop = grey_orig[y0:y1, x0:x1]
+        if crop.size == 0 or min(crop.shape) < 8:
+            continue
+        s = max(3.0, 750.0 / max(crop.shape))
+        up = cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        try:
+            data = pytesseract.image_to_data(
+                up, config="--psm 6 --oem 3",
+                output_type=pytesseract.Output.DICT)
+        except Exception:
+            continue
+        toks = [t.strip() for t, cf in zip(data["text"], data["conf"])
+                if t.strip() and int(cf) >= 25]
+        if not toks:
+            continue
+        joined = " ".join(toks).replace("\u2019", "'")
+
+        # second-chance naming for "Room N" placeholders
+        if not p.get("name"):
+            for span in range(min(3, len(toks)), 0, -1):
+                hit = None
+                for i in range(len(toks) - span + 1):
+                    cand = " ".join(toks[i:i + span])
+                    if len(re.sub(r"[^A-Za-z]", "", cand)) < 3:
+                        continue
+                    hit = _lexicon_match(cand)
+                    if hit:
+                        break
+                if hit:
+                    p["name"] = " ".join(wd.capitalize() for wd in hit.split())
+                    p["conf"] = max(p.get("conf", 50), 55)
+                    break
+
+        # validated dimension parse
+        m = _CROP_DIM.search(joined)
+        if not m:
+            continue
+        a = int(m.group(1)) * FT + (int(m.group(2)) * IN if m.group(2) else 0)
+        b = int(m.group(3)) * FT + (int(m.group(4)) * IN if m.group(4) else 0)
+        if not (1.0 < a < 25 and 1.0 < b < 25):
+            continue
+        ar_txt = max(a, b) / max(0.1, min(a, b))
+        ar_px = max(px_w, px_h) / max(1.0, min(px_w, px_h))
+        if abs(ar_txt - ar_px) / ar_px > 0.35:
+            continue                    # digits misread — reject
+        # width follows the horizontally-larger extent
+        if px_w >= px_h:
+            p["dim_w"], p["dim_l"] = max(a, b), min(a, b)
+        else:
+            p["dim_w"], p["dim_l"] = min(a, b), max(a, b)
+        scale_votes.append(max(a, b) / (max(px_w, px_h) * work_scale))
+        scale_votes.append(min(a, b) / (min(px_w, px_h) * work_scale))
+
+    if len(scale_votes) < 2:
+        return None
+    med = float(np.median(scale_votes))
+    good = [v for v in scale_votes if abs(v - med) / med < 0.30]
+    if len(good) < 2:
+        return None
+    return float(np.median(good))
+
+
+# ── 9c. Outdoor areas (patio / porch): thin-line-enclosed regions ─────────────
+
+_OUTDOOR_NAMES = {"PATIO", "PORCH", "COVERED PORCH", "BALCONY", "DECK",
+                  "TERRACE", "GARDEN"}
+
+def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
+                         polys, thickness: int, h: int, w: int) -> list:
+    """Patio/porch/covered porch are open-sided, so enclosure tests fail.
+    Instead: flood-fill from each outdoor-named OCR label within the thin-ink
+    barrier, clipped to a window around the label. Slight overreach is fine —
+    these render as floor patches, not walled rooms."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                  (int(thickness * 1.2) | 1,) * 2)
+    barrier = cv2.bitwise_or(cv2.morphologyEx(ink_clean, cv2.MORPH_CLOSE, k),
+                             seal)
+    # NOTE: footprint is deliberately NOT a barrier — attached porches sit
+    # inside it. Labeled rooms + walls already stop floods entering the house.
+    barrier[labels > 0] = 255
+    free = (barrier == 0).astype(np.uint8) * 255
+
+    out = []
+    for ph in phrases:
+        name = _lexicon_match(ph["text"])
+        if not name or name not in _OUTDOOR_NAMES:
+            continue
+        cx, cy = int(ph["cx"]), int(ph["cy"])
+        # skip if the label already sits inside a detected room
+        inside = any(cv2.pointPolygonTest(
+            p["pts"].astype(np.float32).reshape(-1, 1, 2),
+            (float(cx), float(cy)), False) >= 0 for p in polys)
+        if inside:
+            continue
+        # nudge the seed off barrier pixels if needed
+        seed = None
+        for r in range(0, 25, 3):
+            for dx, dy in ((0, 0), (r, 0), (-r, 0), (0, r), (0, -r)):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < h and free[y, x] > 0:
+                    seed = (x, y)
+                    break
+            if seed:
+                break
+        if not seed:
+            continue
+        ff = free.copy()
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(ff, mask, seed, 128)
+        region = (ff == 128).astype(np.uint8) * 255
+        # clip to a window around the label to stop border creep
+        win = np.zeros((h, w), np.uint8)
+        hw, hh = int(w * 0.34), int(h * 0.34)
+        win[max(0, cy - hh):min(h, cy + hh), max(0, cx - hw):min(w, cx + hw)] = 255
+        region = cv2.bitwise_and(region, win)
+        region = cv2.morphologyEx(region, cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(
+                                      cv2.MORPH_ELLIPSE, (11, 11)))
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(region, 8)
+        if n <= 1:
+            continue
+        # component containing (or nearest to) the seed
+        sid = lbl[seed[1], seed[0]]
+        if sid == 0:
+            sid = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        comp = (lbl == sid).astype(np.uint8) * 255
+        if int(np.count_nonzero(comp)) < h * w * 0.006:
+            continue
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        eps = 0.012 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
+        if len(approx) < 3:
+            continue
+        pts = _snap_rectilinear(approx)
+        pretty = " ".join(wd.capitalize() for wd in name.split())
+        # dedupe overlapping outdoor regions (e.g. two PORCH labels)
+        c_new = pts.mean(axis=0)
+        if any(np.hypot(*(c_new - o["centroid"])) < min(h, w) * 0.12
+               for o in out):
+            continue
+        out.append({"pts": pts,
+                    "area_px": float(cv2.contourArea(cnt)),
+                    "centroid": c_new,
+                    "names": [], "name": pretty,
+                    "conf": min(90, ph["conf"]),
+                    "outdoor": True})
+    log.info(f"  Outdoor areas: {len(out)} "
+             f"({', '.join(o['name'] for o in out) or 'none'})")
+    return out
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
@@ -984,12 +1176,24 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
     diag = diagonal_walls(barrier, thickness, h, w)
     seal = build_seal(barrier, walls_px, thickness, h, w, diag)
 
-    labels, n_rooms = segment_rooms(seal, wmask, ink_clean, thickness, h, w)
+    labels, n_rooms, footprint = segment_rooms(seal, wmask, ink_clean,
+                                                thickness, h, w)
     polys = polygonize_rooms(labels, n_rooms, thickness, h, w)
-    assign_names(polys, words)
+
+    phrases = build_phrases(words)
+    assign_names(polys, phrases)
+
+    # outdoor areas (patio / porch): label-seeded, added AFTER naming so
+    # their pre-set names aren't clobbered
+    outdoor = detect_outdoor_areas(ink_clean, seal, footprint, labels,
+                                   phrases, polys, thickness, h, w)
+    polys.extend(outdoor)
     openings_px = detect_openings(walls_px, wmask, ink_clean, thickness, h, w)
-    dim_words = ocr_dimensions(grey_orig, ws)
-    scale_m = calibrate_scale(words + dim_words, polys)
+    # names + validated dimensions from high-res per-room crops
+    scale_m = recover_room_details(polys, grey_orig, ws, h, w)
+    if not scale_m:
+        dim_words = ocr_dimensions(grey_orig, ws)
+        scale_m = calibrate_scale(words + dim_words, polys)
     if scale_m:
         log.info(f"  Scale: {scale_m*1000:.2f} mm/px")
 
@@ -1017,9 +1221,19 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
                 "height": round(float(ys.max() - ys.min()) / h * 100, 3),
             },
         }
-        if scale_m:
+        # pixel extents always included: lets the app derive ALL room
+        # measurements from a single user-entered dimension when the plan's
+        # text is too low-res for auto-scale
+        room["px_size"] = {"w": round(float(xs.max() - xs.min()), 1),
+                           "h": round(float(ys.max() - ys.min()), 1)}
+        # dimensions read directly off the plan beat scale-derived ones
+        if p.get("dim_l") and p.get("dim_w"):
+            room["length"] = p["dim_l"]
+            room["width"] = p["dim_w"]
+        elif scale_m:
             room["length"] = round((ys.max() - ys.min()) * scale_m, 2)
             room["width"] = round((xs.max() - xs.min()) * scale_m, 2)
+        if scale_m:
             # true polygon area (shoelace), not bbox area
             px_area = 0.5 * abs(float(
                 np.dot(p["pts"][:, 0], np.roll(p["pts"][:, 1], 1)) -
