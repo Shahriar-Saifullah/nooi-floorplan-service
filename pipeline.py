@@ -282,7 +282,7 @@ def build_seal(barrier, walls_px: list, thickness: int, h: int, w: int,
     # window bands). Collinearity makes long bridges safe: if two wall stubs
     # line up, the gap between them is an opening in that same wall.
     col_tol = thickness * 1.2
-    max_span = thickness * 14
+    max_span = thickness * 22
     hsegs = [s for s in walls_px
              if abs(s["x2"] - s["x1"]) >= abs(s["y2"] - s["y1"])]
     vsegs = [s for s in walls_px
@@ -883,7 +883,7 @@ def detect_openings(walls: list, wall_mask, ink_clean, thickness: int,
     openings = []
     band = max(2, int(thickness * 0.5))
     min_gap = int(thickness * 1.1)
-    max_gap = int(thickness * 14)
+    max_gap = int(thickness * 22)
     col_tol = thickness * 1.2
 
     for horiz in (True, False):
@@ -959,6 +959,127 @@ def _dedup_openings_px(openings: list, thickness: int) -> list:
                    < thickness * 2 for u in unique):
             unique.append(op)
     return unique
+
+
+
+
+# ── 8b. Continuous render walls + within-wall opening scan ───────────────────
+# The raw vectorized fragments have gaps at every door/window. For 2D/3D
+# rendering we fuse collinear fragments across those gaps into CONTINUOUS
+# walls (Coohom-style), then scan along each continuous wall and classify
+# every low-coverage run as a door or window — so openings become cuts in a
+# solid wall instead of holes between floating panels.
+
+def build_render_walls(walls_px: list, thickness: int, h: int, w: int) -> list:
+    segs = [dict(s) for s in walls_px]
+    merged = _merge_collinear(segs, tol=thickness * 1.2)
+    # aggressive second pass: also merge across opening-sized gaps
+    out, used = [], set()
+    for horiz in (True, False):
+        group = []
+        for i, s in enumerate(merged):
+            is_h = abs(s["x2"] - s["x1"]) >= abs(s["y2"] - s["y1"])
+            if is_h == horiz:
+                group.append(s)
+        # cluster by axis
+        key = (lambda s: s["y1"]) if horiz else (lambda s: s["x1"])
+        group.sort(key=key)
+        clusters = []
+        for s in group:
+            if clusters and abs(key(s) - key(clusters[-1][-1])) <= thickness * 1.2:
+                clusters[-1].append(s)
+            else:
+                clusters.append([s])
+        for cl in clusters:
+            lo_k = (lambda s: min(s["x1"], s["x2"])) if horiz                 else (lambda s: min(s["y1"], s["y2"]))
+            hi_k = (lambda s: max(s["x1"], s["x2"])) if horiz                 else (lambda s: max(s["y1"], s["y2"]))
+            cl.sort(key=lo_k)
+            cur = dict(cl[0])
+            for s in cl[1:]:
+                gap = lo_k(s) - hi_k(cur)
+                if gap <= thickness * 16:      # fuse across door/slider gaps
+                    if horiz:
+                        cur["x1"] = min(cur["x1"], cur["x2"], s["x1"], s["x2"])
+                        cur["x2"] = max(cur["x1"], cur["x2"], s["x1"], s["x2"])
+                        cur["y1"] = cur["y2"] = float(np.mean(
+                            [cur["y1"], s["y1"]]))
+                    else:
+                        cur["y1"] = min(cur["y1"], cur["y2"], s["y1"], s["y2"])
+                        cur["y2"] = max(cur["y1"], cur["y2"], s["y1"], s["y2"])
+                        cur["x1"] = cur["x2"] = float(np.mean(
+                            [cur["x1"], s["x1"]]))
+                    cur["thickness"] = max(cur["thickness"], s["thickness"])
+                else:
+                    out.append(cur)
+                    cur = dict(s)
+            out.append(cur)
+    log.info(f"  Render walls: {len(out)} continuous "
+             f"(from {len(walls_px)} fragments)")
+    return out
+
+
+def scan_wall_openings(render_walls: list, wall_mask, ink_clean,
+                       thickness: int, h: int, w: int) -> list:
+    """Walk each CONTINUOUS wall; classify low-wall-coverage runs:
+         thin ink present -> window,   empty -> door."""
+    openings = []
+    band = max(2, int(thickness * 0.5))
+    min_open = int(thickness * 1.1)
+    max_open = int(thickness * 16)
+
+    for wi, seg in enumerate(render_walls):
+        horiz = abs(seg["x2"] - seg["x1"]) >= abs(seg["y2"] - seg["y1"])
+        if horiz:
+            a = int(min(seg["x1"], seg["x2"])); b = int(max(seg["x1"], seg["x2"]))
+            c = int(seg["y1"])
+        else:
+            a = int(min(seg["y1"], seg["y2"])); b = int(max(seg["y1"], seg["y2"]))
+            c = int(seg["x1"])
+        L = b - a
+        if L < min_open * 2:
+            continue
+        c = _refine_axis(wall_mask, c, a, b, horiz, thickness, h, w)
+
+        cov = np.zeros(L, np.float32)
+        inkl = np.zeros(L, np.float32)
+        lo = max(0, c - band)
+        if horiz:
+            hi = min(h, c + band + 1)
+            strip_w = wall_mask[lo:hi, a:b]
+            strip_i = ink_clean[lo:hi, a:b]
+            cov = (strip_w > 128).mean(axis=0)
+            inkl = (strip_i > 128).mean(axis=0)
+        else:
+            hi = min(w, c + band + 1)
+            strip_w = wall_mask[a:b, lo:hi]
+            strip_i = ink_clean[a:b, lo:hi]
+            cov = (strip_w > 128).mean(axis=1)
+            inkl = (strip_i > 128).mean(axis=1)
+
+        k = max(3, thickness // 2) | 1
+        cov = cv2.blur(cov.reshape(1, -1).astype(np.float32), (k, 1)).ravel()
+        absent = cov < 0.30
+        t = 0
+        while t < L:
+            if not absent[t]:
+                t += 1
+                continue
+            t0 = t
+            while t < L and absent[t]:
+                t += 1
+            run = t - t0
+            if run < min_open or run > max_open:
+                continue
+            mean_ink = float(inkl[t0:t].mean()) if t > t0 else 0.0
+            kind = "window" if mean_ink > 0.12 else "door"
+            mid = a + (t0 + t) // 2
+            px, py = (mid, c) if horiz else (c, mid)
+            openings.append({
+                "type": kind, "wall_index": wi,
+                "wall": "horizontal" if horiz else "vertical",
+                "px": px, "py": py, "len_px": run,
+            })
+    return openings
 
 
 # ── 9. Scale calibration from dimension text ──────────────────────────────────
@@ -1303,6 +1424,119 @@ async def gemini_dimensions(image_bytes: bytes, polys: list,
     return float(np.median(good)) if len(good) >= 2 else None
 
 
+
+
+# ── 10. Output wall shell: chain fragments into continuous walls ─────────────
+# Raw vectorized fragments have holes wherever windows/doors interrupt them,
+# which renders as a broken 3D shell. For OUTPUT we chain collinear stubs
+# across their gaps into one continuous wall (the gaps stay recorded as
+# openings, which the 3D cuts back out as doors/windows), and extend wall
+# ends to meet perpendicular walls so corners close.
+
+def chain_output_walls(walls_px: list, openings_px: list, thickness: int,
+                       h: int, w: int):
+    col_tol = thickness * 1.2
+    max_span = thickness * 22
+    chains = []
+
+    for horiz in (True, False):
+        segs = []
+        for s in walls_px:
+            is_h = abs(s["x2"] - s["x1"]) >= abs(s["y2"] - s["y1"])
+            if is_h != horiz:
+                continue
+            if horiz:
+                a, b = sorted((s["x1"], s["x2"])); c = s["y1"]
+            else:
+                a, b = sorted((s["y1"], s["y2"])); c = s["x1"]
+            segs.append({"a": a, "b": b, "c": c, "t": s["thickness"]})
+        segs.sort(key=lambda s: s["c"])
+        clusters = []
+        for s in segs:
+            if clusters and abs(s["c"] - clusters[-1][-1]["c"]) <= col_tol:
+                clusters[-1].append(s)
+            else:
+                clusters.append([s])
+        for cl in clusters:
+            cl.sort(key=lambda s: s["a"])
+            cur = dict(cl[0])
+            members = [cl[0]]
+            for s in cl[1:]:
+                if s["a"] - cur["b"] <= max_span:
+                    cur["b"] = max(cur["b"], s["b"])
+                    cur["t"] = max(cur["t"], s["t"])
+                    members.append(s)
+                else:
+                    cur["c"] = float(np.average(
+                        [m["c"] for m in members],
+                        weights=[m["b"] - m["a"] + 1 for m in members]))
+                    chains.append({"horiz": horiz, **cur})
+                    cur = dict(s); members = [s]
+            cur["c"] = float(np.average(
+                [m["c"] for m in members],
+                weights=[m["b"] - m["a"] + 1 for m in members]))
+            chains.append({"horiz": horiz, **cur})
+
+    # corner closure: extend each chain end to the nearest perpendicular
+    # chain line within reach, if that chain's span covers this axis position
+    reach = thickness * 4.0
+    for ch in chains:
+        for end in ("a", "b"):
+            best = None
+            for other in chains:
+                if other["horiz"] == ch["horiz"]:
+                    continue
+                # other's axis line position along ch's direction:
+                line = other["c"]
+                lo, hi = other["a"], other["b"]
+                if not (lo - col_tol <= ch["c"] <= hi + col_tol):
+                    continue
+                d = (ch[end] - line) if end == "a" else (line - ch[end])
+                # gap beyond the endpoint (positive means line lies outward)
+                gap = -d
+                if 0 < gap <= reach and (best is None or gap < best[0]):
+                    best = (gap, line)
+            if best is not None:
+                ch[end] = (min(ch["a"], best[1]) if end == "a"
+                           else max(ch["b"], best[1]))
+
+    out_walls = []
+    for ch in chains:
+        if ch["b"] - ch["a"] < thickness * 1.2:
+            continue
+        if ch["horiz"]:
+            out_walls.append({"x1": ch["a"], "y1": ch["c"],
+                              "x2": ch["b"], "y2": ch["c"],
+                              "thickness": ch["t"]})
+        else:
+            out_walls.append({"x1": ch["c"], "y1": ch["a"],
+                              "x2": ch["c"], "y2": ch["b"],
+                              "thickness": ch["t"]})
+
+    # re-home each opening onto the chained wall that now contains it
+    for op in openings_px:
+        horiz = op["wall"] == "horizontal"
+        pos = op["px"] if horiz else op["py"]
+        axis = op["py"] if horiz else op["px"]
+        best_i, best_d = 0, 1e18
+        for i, wl in enumerate(out_walls):
+            is_h = abs(wl["x2"] - wl["x1"]) >= abs(wl["y2"] - wl["y1"])
+            if is_h != horiz:
+                continue
+            c = wl["y1"] if is_h else wl["x1"]
+            lo = min(wl["x1"], wl["x2"]) if is_h else min(wl["y1"], wl["y2"])
+            hi = max(wl["x1"], wl["x2"]) if is_h else max(wl["y1"], wl["y2"])
+            if not (lo - col_tol <= pos <= hi + col_tol):
+                continue
+            d = abs(axis - c)
+            if d < best_d:
+                best_d, best_i = d, i
+        op["wall_index"] = best_i
+
+    log.info(f"  Shell: {len(walls_px)} fragments -> {len(out_walls)} walls")
+    return out_walls
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
@@ -1342,6 +1576,8 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
                                    phrases, polys, thickness, h, w)
     polys.extend(outdoor)
     openings_px = detect_openings(walls_px, wmask, ink_clean, thickness, h, w)
+    walls_px = chain_output_walls(walls_px, openings_px, thickness, h, w)
+
     # names + validated dimensions from high-res per-room crops
     scale_m = recover_room_details(polys, grey_orig, ws, h, w)
     if not scale_m:
