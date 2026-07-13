@@ -1,20 +1,3 @@
-"""
-Floor Plan Analysis Pipeline v3 — polygon-based reconstruction
----------------------------------------------------------------
-Architecture (geometry-first, OCR names only):
-  1. Binarize ink, OCR all text, then ERASE text from the ink mask
-  2. Wall mask     = thick strokes only (auto-estimated wall thickness)
-  3. Rooms         = watershed on sealed wall mask -> true room POLYGONS
-  4. Names         = OCR labels assigned by point-in-polygon
-  5. Walls         = vectorized H/V centerlines from the wall mask
-  6. Openings      = classified along each wall band:
-                       no wall + no ink    -> door (gap)
-                       no wall + thin ink  -> window (glazing lines)
-  7. Scale         = parsed from dimension strings like 14'-7" x 16'
-
-Pure OpenCV + Tesseract. No external AI APIs. CPU-only.
-"""
-
 import logging
 import re
 import cv2
@@ -1220,16 +1203,33 @@ def recover_room_details(polys: list, grey_orig, work_scale: float,
 _OUTDOOR_NAMES = {"PATIO", "PORCH", "COVERED PORCH", "BALCONY", "DECK",
                   "TERRACE", "GARDEN"}
 
-def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
-                         polys, thickness: int, h: int, w: int) -> list:
+def detect_outdoor_areas(grey, ink_clean, seal, footprint, labels, phrases,
+                         polys, words, thickness: int, h: int, w: int) -> list:
     """Patio/porch/covered porch are open-sided, so enclosure tests fail.
     Instead: flood-fill from each outdoor-named OCR label within the thin-ink
     barrier, clipped to a window around the label. Slight overreach is fine —
     these render as floor patches, not walled rooms."""
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                  (int(thickness * 1.2) | 1,) * 2)
-    barrier = cv2.bitwise_or(cv2.morphologyEx(ink_clean, cv2.MORPH_CLOSE, k),
-                             seal)
+    # Outdoor outlines are pale double lines + dashes that global Otsu
+    # binarization DISCARDS — so build a dedicated LIGHT-ink layer for them:
+    # near-white-sensitive threshold, speck removal, then directional
+    # closings to reconnect the dashes into continuous boundaries.
+    light = (cv2.GaussianBlur(grey, (3, 3), 0) < 245).astype(np.uint8) * 255
+    light = cv2.morphologyEx(light, cv2.MORPH_OPEN,
+                             np.ones((2, 2), np.uint8))
+    # text glyphs are light too — erase OCR word boxes so a label's own
+    # letters can't wall in the flood seed placed right next to it
+    light = erase_text(light, words, h, w)
+    # Bridge dashed outlines with a SMALL closing only: outdoor interiors are
+    # often textured with light deck-board lines ~1-2 wall-thicknesses apart,
+    # and a large closing fuses that texture into a solid block that entombs
+    # the flood seed (the porch became a 12-pixel pocket).
+    blen = max(5, int(thickness * 0.9)) | 1
+    kh = cv2.getStructuringElement(cv2.MORPH_RECT, (blen, 1))
+    kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, blen))
+    bridged = cv2.bitwise_or(
+        cv2.morphologyEx(light, cv2.MORPH_CLOSE, kh),
+        cv2.morphologyEx(light, cv2.MORPH_CLOSE, kv))
+    barrier = cv2.bitwise_or(bridged, seal)
     # NOTE: footprint is deliberately NOT a barrier — attached porches sit
     # inside it. Labeled rooms + walls already stop floods entering the house.
     barrier[labels > 0] = 255
@@ -1264,34 +1264,55 @@ def detect_outdoor_areas(ink_clean, seal, footprint, labels, phrases,
         log.info("  Outdoor areas: 0 (none)")
         return out
 
-    # Pass 2: flood the outdoor space once per seed, then split shared
-    # ground by NEAREST label (several labels usually share one connected
-    # outdoor area — patio, porch, covered porch wrap around the house)
-    flooded = np.zeros((h, w), np.uint8)
+    # Pass 2: flood ALL labels first (no claiming). Seeds sharing one
+    # connected area (patio+porch behind a faint divider) get that area's
+    # TRUE outer boundary, split internally by nearest label. Only floods
+    # that reach the image border fall back to window-clip + spur shave.
     for s in seeds:
         ff = free.copy()
         mask = np.zeros((h + 2, w + 2), np.uint8)
         cv2.floodFill(ff, mask, s["seed"], 128)
-        flooded |= (ff == 128).astype(np.uint8)
+        s["flood"] = (ff == 128)
+        ys_r, xs_r = np.nonzero(s["flood"])
+        s["touches"] = bool(ys_r.min() <= 2 or xs_r.min() <= 2 or
+                            ys_r.max() >= h - 3 or xs_r.max() >= w - 3)
+        s["frac"] = ys_r.size / (h * w)
 
-    ys_f, xs_f = np.nonzero(flooded)
-    if ys_f.size == 0:
-        log.info("  Outdoor areas: 0 (none)")
-        return out
-    d2 = np.stack([(xs_f - s["cx"]) ** 2 + (ys_f - s["cy"]) ** 2
-                   for s in seeds])           # (n_seeds, n_pixels)
-    owner = np.argmin(d2, axis=0)
+    union = np.zeros((h, w), bool)
+    for s in seeds:
+        union |= s["flood"]
+    ys_f, xs_f = np.nonzero(union)
+    if ys_f.size:
+        # nearest label among the seeds whose flood actually covers the pixel
+        dists = []
+        for s in seeds:
+            d = (xs_f - s["cx"]) ** 2.0 + (ys_f - s["cy"]) ** 2.0
+            d[~s["flood"][ys_f, xs_f]] = np.inf
+            dists.append(d)
+        owner = np.argmin(np.stack(dists), axis=0)
+        for si, s in enumerate(seeds):
+            region = np.zeros((h, w), np.uint8)
+            sel = owner == si
+            region[ys_f[sel], xs_f[sel]] = 255
+            if s["touches"] or not (0.005 < s["frac"] < 0.45):
+                # leaky: window-clip + shave
+                win = np.zeros((h, w), np.uint8)
+                hw, hh = int(w * 0.34), int(h * 0.34)
+                win[max(0, s["cy"] - hh):min(h, s["cy"] + hh),
+                    max(0, s["cx"] - hw):min(w, s["cx"] + hw)] = 255
+                region = cv2.bitwise_and(region, win)
+                shave = cv2.getStructuringElement(
+                    cv2.MORPH_RECT, (int(thickness * 3) | 1,) * 2)
+                region = cv2.morphologyEx(region, cv2.MORPH_OPEN, shave)
+            else:
+                log.info(f"    {s['name']}: true outer boundary "
+                         f"({s['frac']*100:.1f}%)")
+            s["region"] = region
 
-    for si, s in enumerate(seeds):
-        region = np.zeros((h, w), np.uint8)
-        sel = owner == si
-        region[ys_f[sel], xs_f[sel]] = 255
-        # clip to a window around the label to stop border creep
-        win = np.zeros((h, w), np.uint8)
-        hw, hh = int(w * 0.34), int(h * 0.34)
-        win[max(0, s["cy"] - hh):min(h, s["cy"] + hh),
-            max(0, s["cx"] - hw):min(w, s["cx"] + hw)] = 255
-        region = cv2.bitwise_and(region, win)
+    for s in seeds:
+        region = s.get("region")
+        if region is None:
+            continue
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE,
                                   cv2.getStructuringElement(
                                       cv2.MORPH_ELLIPSE, (11, 11)))
@@ -1572,8 +1593,8 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
 
     # outdoor areas (patio / porch): label-seeded, added AFTER naming so
     # their pre-set names aren't clobbered
-    outdoor = detect_outdoor_areas(ink_clean, seal, footprint, labels,
-                                   phrases, polys, thickness, h, w)
+    outdoor = detect_outdoor_areas(grey, ink_clean, seal, footprint, labels,
+                                   phrases, polys, words, thickness, h, w)
     polys.extend(outdoor)
     openings_px = detect_openings(walls_px, wmask, ink_clean, thickness, h, w)
     walls_px = chain_output_walls(walls_px, openings_px, thickness, h, w)
