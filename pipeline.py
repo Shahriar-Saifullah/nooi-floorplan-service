@@ -1558,6 +1558,54 @@ def chain_output_walls(walls_px: list, openings_px: list, thickness: int,
     return out_walls
 
 
+
+
+def _regularize_doors(openings: list, thickness: int) -> list:
+    """Two fixes observed in 3D side views:
+    1. MERGE doors on the same wall whose edges nearly touch — a single real
+       door sometimes splits into two detected openings across an artifact.
+    2. NORMALIZE interior door widths: standard doors on a plan are all the
+       same size; per-gap measurement noise makes them render differently.
+       Snap door widths within +/-35%% of the median to the median."""
+    # 1) merge near-duplicates per wall
+    doors = [o for o in openings if o["type"] == "door"]
+    others = [o for o in openings if o["type"] != "door"]
+    by_wall: dict = {}
+    for o in doors:
+        by_wall.setdefault((o["wall_index"], o["wall"]), []).append(o)
+    merged = []
+    for key, group in by_wall.items():
+        horiz = key[1] == "horizontal"
+        group.sort(key=lambda o: o["px"] if horiz else o["py"])
+        cur = dict(group[0])
+        for o in group[1:]:
+            c_cur = cur["px"] if horiz else cur["py"]
+            c_o = o["px"] if horiz else o["py"]
+            gap = (c_o - o["len_px"] / 2) - (c_cur + cur["len_px"] / 2)
+            if gap < thickness * 1.5:
+                lo = min(c_cur - cur["len_px"] / 2, c_o - o["len_px"] / 2)
+                hi = max(c_cur + cur["len_px"] / 2, c_o + o["len_px"] / 2)
+                mid = (lo + hi) / 2
+                cur["len_px"] = hi - lo
+                if horiz:
+                    cur["px"] = int(mid)
+                else:
+                    cur["py"] = int(mid)
+            else:
+                merged.append(cur)
+                cur = dict(o)
+        merged.append(cur)
+
+    # 2) normalize standard door widths to the median
+    std = [o for o in merged if o["len_px"] <= thickness * 4.5]
+    if len(std) >= 3:
+        med = float(np.median([o["len_px"] for o in std]))
+        for o in std:
+            if abs(o["len_px"] - med) / med <= 0.35:
+                o["len_px"] = med
+    return merged + others
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
@@ -1597,6 +1645,7 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
                                    phrases, polys, words, thickness, h, w)
     polys.extend(outdoor)
     openings_px = detect_openings(walls_px, wmask, ink_clean, thickness, h, w)
+    openings_px = _regularize_doors(openings_px, thickness)
     walls_px = chain_output_walls(walls_px, openings_px, thickness, h, w)
 
     # names + validated dimensions from high-res per-room crops
