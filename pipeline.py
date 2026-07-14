@@ -1455,7 +1455,7 @@ async def gemini_dimensions(image_bytes: bytes, polys: list,
 # ends to meet perpendicular walls so corners close.
 
 def chain_output_walls(walls_px: list, openings_px: list, thickness: int,
-                       h: int, w: int):
+                       h: int, w: int, wall_mask=None):
     col_tol = thickness * 1.2
     max_span = thickness * 22
     chains = []
@@ -1520,6 +1520,71 @@ def chain_output_walls(walls_px: list, openings_px: list, thickness: int,
             if best is not None:
                 ch[end] = (min(ch["a"], best[1]) if end == "a"
                            else max(ch["b"], best[1]))
+
+    # synthesize RETURN WALLS: two parallel chains whose ends sit close in
+    # the along-axis direction but offset across it (a bay/bump-out) need a
+    # short perpendicular connector, or the 3D shell shows a gap between them
+    connectors = []
+    for i in range(len(chains)):
+        for j in range(i + 1, len(chains)):
+            a, b = chains[i], chains[j]
+            if a["horiz"] != b["horiz"]:
+                continue
+            off = abs(a["c"] - b["c"])
+            if not (col_tol < off <= thickness * 10):
+                continue
+            # connect an ENDPOINT of one chain to the other chain wherever
+            # the other's span covers it (bay walls meet the middle of the
+            # long facade chain, not its ends)
+            for src_ch, dst_ch in ((a, b), (b, a)):
+                for e in ("a", "b"):
+                    pos = src_ch[e]
+                    if dst_ch["a"] - col_tol <= pos <= dst_ch["b"] + col_tol:
+                        lo, hi = sorted((a["c"], b["c"]))
+                        connectors.append({
+                            "horiz": not a["horiz"],
+                            "a": lo, "b": hi, "c": pos,
+                            "t": min(a["t"], b["t"]),
+                        })
+    # keep only connectors backed by ACTUAL drawn wall ink — a real return
+    # wall exists in the drawing; a fictional shortcut between two unrelated
+    # parallel walls does not
+    if wall_mask is not None:
+        band = max(2, int(thickness * 0.8))
+        backed = []
+        for c0 in connectors:
+            lo, hi = int(c0["a"]), int(c0["b"])
+            if hi - lo < 2:
+                continue
+            # the drawn return wall may sit a few px off the chain endpoint:
+            # search cc +/- thickness for the best-covered line and refine
+            best_cov, best_cc = 0.0, int(c0["c"])
+            for dc in range(-thickness, thickness + 1, 2):
+                cc = int(c0["c"]) + dc
+                if c0["horiz"]:
+                    y0, y1 = max(0, cc - band), min(h, cc + band + 1)
+                    strip = wall_mask[y0:y1, max(0, lo):min(w, hi)]
+                else:
+                    x0, x1 = max(0, cc - band), min(w, cc + band + 1)
+                    strip = wall_mask[max(0, lo):min(h, hi), x0:x1]
+                cov = float(np.mean(strip > 128)) if strip.size else 0.0
+                if cov > best_cov:
+                    best_cov, best_cc = cov, cc
+            if best_cov >= 0.40:
+                c0["c"] = float(best_cc)
+                backed.append(c0)
+        connectors = backed
+    # avoid duplicate connectors at the same spot
+    dedup = []
+    for c0 in connectors:
+        if not any(c1["horiz"] == c0["horiz"] and
+                   abs(c1["c"] - c0["c"]) < thickness * 1.5 and
+                   abs(c1["a"] - c0["a"]) < thickness * 1.5
+                   for c1 in dedup):
+            dedup.append(c0)
+    if dedup:
+        log.info(f"  Shell: +{len(dedup)} return-wall connectors")
+    chains.extend(dedup)
 
     out_walls = []
     for ch in chains:
@@ -1646,7 +1711,8 @@ async def analyse_floor_plan(image_bytes: bytes, image_url: str = "",
     polys.extend(outdoor)
     openings_px = detect_openings(walls_px, wmask, ink_clean, thickness, h, w)
     openings_px = _regularize_doors(openings_px, thickness)
-    walls_px = chain_output_walls(walls_px, openings_px, thickness, h, w)
+    walls_px = chain_output_walls(walls_px, openings_px, thickness, h, w,
+                                  wall_mask=wmask)
 
     # names + validated dimensions from high-res per-room crops
     scale_m = recover_room_details(polys, grey_orig, ws, h, w)
