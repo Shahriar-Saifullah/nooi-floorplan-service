@@ -1,0 +1,346 @@
+{
+  "plan": "great-room.jpeg",
+  "note": "Sample plan 3 (the 'test 11111' project). Coordinates in ORIGINAL image pixels (575x459). Each check is an axis-aligned segment [x1, y1, x2, y2].",
+  "tol": 7,
+  "walls": [
+    {
+      "name": "west exterior (W.I.C. / master bed)",
+      "seg": [
+        44,
+        100,
+        44,
+        324
+      ]
+    },
+    {
+      "name": "master bed front",
+      "seg": [
+        44,
+        324,
+        148,
+        324
+      ]
+    },
+    {
+      "name": "fireplace wall (great room west)",
+      "seg": [
+        152,
+        232,
+        152,
+        348
+      ]
+    },
+    {
+      "name": "master bath east",
+      "seg": [
+        187,
+        78,
+        187,
+        204
+      ]
+    },
+    {
+      "name": "kitchen back (north)",
+      "seg": [
+        268,
+        136,
+        465,
+        136
+      ]
+    },
+    {
+      "name": "kitchen / dining east",
+      "seg": [
+        465,
+        136,
+        465,
+        322
+      ]
+    },
+    {
+      "name": "dining front",
+      "seg": [
+        302,
+        324,
+        465,
+        324
+      ]
+    },
+    {
+      "name": "laundry / fridge wall",
+      "seg": [
+        305,
+        138,
+        305,
+        222
+      ]
+    },
+    {
+      "name": "bay front (great room)",
+      "seg": [
+        151,
+        350,
+        302,
+        350
+      ]
+    }
+  ],
+  "open": [
+    {
+      "name": "open kitchen / dining (no wall)",
+      "seg": [
+        330,
+        224,
+        440,
+        224
+      ]
+    },
+    {
+      "name": "open great room / dining (no wall)",
+      "seg": [
+        300,
+        238,
+        300,
+        316
+      ]
+    },
+    {
+      "name": "open great room front (bay is open to the room)",
+      "seg": [
+        165,
+        324,
+        290,
+        324
+      ]
+    }
+  ],
+  "openings": [
+    {
+      "name": "kitchen window",
+      "type": "window",
+      "seg": [
+        370,
+        136,
+        425,
+        136
+      ]
+    },
+    {
+      "name": "kitchen door to patio",
+      "type": "door",
+      "seg": [
+        330,
+        136,
+        350,
+        136
+      ]
+    },
+    {
+      "name": "dining side door to porch",
+      "type": "door",
+      "seg": [
+        465,
+        230,
+        465,
+        250
+      ]
+    },
+    {
+      "name": "dining side window",
+      "type": "window",
+      "seg": [
+        465,
+        262,
+        465,
+        303
+      ]
+    },
+    {
+      "name": "dining sliding door",
+      "type": "door",
+      "min_width": 60,
+      "seg": [
+        345,
+        324,
+        430,
+        324
+      ]
+    },
+    {
+      "name": "great room sliding door",
+      "type": "door",
+      "min_width": 80,
+      "seg": [
+        165,
+        350,
+        295,
+        350
+      ]
+    },
+    {
+      "name": "bay side window (east)",
+      "type": "window",
+      "seg": [
+        303,
+        330,
+        303,
+        346
+      ]
+    },
+    {
+      "name": "bay side window (west)",
+      "type": "window",
+      "seg": [
+        151,
+        330,
+        151,
+        346
+      ]
+    },
+    {
+      "name": "master bed front window",
+      "type": "window",
+      "seg": [
+        60,
+        324,
+        130,
+        324
+      ]
+    },
+    {
+      "name": "master bed side window",
+      "type": "window",
+      "seg": [
+        44,
+        287,
+        44,
+        312
+      ]
+    }
+  ],
+  "max_duplicate_walls": 0,
+  "names": [
+    {
+      "name": "Patio",
+      "at": [
+        377,
+        76
+      ],
+      "accept": [
+        "patio"
+      ]
+    },
+    {
+      "name": "W.I.C.",
+      "at": [
+        76,
+        130
+      ],
+      "accept": [
+        "wic",
+        "closet"
+      ]
+    },
+    {
+      "name": "M. Bath",
+      "at": [
+        152,
+        136
+      ],
+      "accept": [
+        "bath"
+      ]
+    },
+    {
+      "name": "Kitchen",
+      "at": [
+        388,
+        192
+      ],
+      "accept": [
+        "kitchen"
+      ]
+    },
+    {
+      "name": "Porch",
+      "at": [
+        510,
+        192
+      ],
+      "accept": [
+        "porch"
+      ]
+    },
+    {
+      "name": "Elevator",
+      "at": [
+        259,
+        201
+      ],
+      "accept": [
+        "elev"
+      ]
+    },
+    {
+      "name": "Master Bed Rm",
+      "at": [
+        100,
+        216
+      ],
+      "accept": [
+        "master"
+      ]
+    },
+    {
+      "name": "Dining",
+      "at": [
+        388,
+        233
+      ],
+      "accept": [
+        "dining"
+      ]
+    },
+    {
+      "name": "Great Room",
+      "at": [
+        220,
+        274
+      ],
+      "accept": [
+        "great"
+      ]
+    },
+    {
+      "name": "Covered Porch",
+      "at": [
+        232,
+        389
+      ],
+      "accept": [
+        "porch"
+      ]
+    },
+    {
+      "name": "Laundry",
+      "at": [
+        270,
+        166
+      ],
+      "accept": [
+        "laundry"
+      ]
+    },
+    {
+      "name": "Powder",
+      "at": [
+        157,
+        188
+      ],
+      "accept": [
+        "pwdr",
+        "powder"
+      ]
+    }
+  ]
+}

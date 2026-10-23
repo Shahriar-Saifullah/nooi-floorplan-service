@@ -1,0 +1,273 @@
+{
+  "plan": "carport.jpeg",
+  "note": "Sample plan 1. Coordinates in ORIGINAL image pixels (500x727). Exterior walls are drawn as grey double lines.",
+  "tol": 7,
+  "walls": [
+    {
+      "name": "west exterior (house)",
+      "seg": [
+        32,
+        47,
+        32,
+        470
+      ]
+    },
+    {
+      "name": "north exterior",
+      "seg": [
+        32,
+        47,
+        277,
+        47
+      ]
+    },
+    {
+      "name": "master bed east",
+      "seg": [
+        277,
+        47,
+        277,
+        200
+      ]
+    },
+    {
+      "name": "patio wall",
+      "seg": [
+        277,
+        202,
+        448,
+        202
+      ]
+    },
+    {
+      "name": "living east",
+      "seg": [
+        448,
+        202,
+        448,
+        410
+      ]
+    },
+    {
+      "name": "utility south",
+      "seg": [
+        32,
+        472,
+        150,
+        472
+      ]
+    }
+  ],
+  "open": [
+    {
+      "name": "open dining / living",
+      "seg": [
+        255,
+        250,
+        255,
+        390
+      ]
+    },
+    {
+      "name": "open kitchen / dining",
+      "seg": [
+        60,
+        300,
+        250,
+        300
+      ]
+    },
+    {
+      "name": "open carport (middle)",
+      "seg": [
+        122,
+        485,
+        122,
+        660
+      ]
+    },
+    {
+      "name": "open carport (east side)",
+      "seg": [
+        250,
+        490,
+        250,
+        660
+      ]
+    },
+    {
+      "name": "open carport (across)",
+      "seg": [
+        45,
+        600,
+        240,
+        600
+      ]
+    },
+    {
+      "name": "open carport (south, storage to post)",
+      "seg": [
+        140,
+        674,
+        225,
+        674
+      ]
+    }
+  ],
+  "openings": [
+    {
+      "name": "master north window",
+      "type": "window",
+      "seg": [
+        240,
+        47,
+        270,
+        47
+      ]
+    },
+    {
+      "name": "living east window",
+      "type": "window",
+      "seg": [
+        448,
+        210,
+        448,
+        250
+      ]
+    },
+    {
+      "name": "living south window",
+      "type": "window",
+      "seg": [
+        400,
+        412,
+        435,
+        412
+      ]
+    }
+  ],
+  "max_duplicate_walls": 0,
+  "names": [
+    {
+      "name": "Master Bedroom",
+      "at": [
+        191,
+        100
+      ],
+      "accept": [
+        "master"
+      ]
+    },
+    {
+      "name": "M Bath",
+      "at": [
+        94,
+        158
+      ],
+      "accept": [
+        "bath"
+      ]
+    },
+    {
+      "name": "Covered Patio",
+      "at": [
+        370,
+        161
+      ],
+      "accept": [
+        "patio"
+      ]
+    },
+    {
+      "name": "Dining",
+      "at": [
+        227,
+        316
+      ],
+      "accept": [
+        "dining"
+      ]
+    },
+    {
+      "name": "Living",
+      "at": [
+        347,
+        315
+      ],
+      "accept": [
+        "living"
+      ]
+    },
+    {
+      "name": "Kitchen",
+      "at": [
+        111,
+        382
+      ],
+      "accept": [
+        "kitchen"
+      ]
+    },
+    {
+      "name": "Powder",
+      "at": [
+        214,
+        431
+      ],
+      "accept": [
+        "pwdr",
+        "powder"
+      ]
+    },
+    {
+      "name": "Utility",
+      "at": [
+        92,
+        458
+      ],
+      "accept": [
+        "utility"
+      ]
+    },
+    {
+      "name": "Mud",
+      "at": [
+        164,
+        453
+      ],
+      "accept": [
+        "mud"
+      ]
+    },
+    {
+      "name": "Porch",
+      "at": [
+        278,
+        455
+      ],
+      "accept": [
+        "porch"
+      ]
+    },
+    {
+      "name": "Carport",
+      "at": [
+        138,
+        567
+      ],
+      "accept": [
+        "carport"
+      ]
+    },
+    {
+      "name": "Storage",
+      "at": [
+        79,
+        692
+      ],
+      "accept": [
+        "storage"
+      ]
+    }
+  ]
+}

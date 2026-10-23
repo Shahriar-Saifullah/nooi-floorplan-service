@@ -3,3 +3,6 @@ dist/
 .env
 *.log
 .DS_Store
+# plan check overlays (python tests/check_plans.py --overlay)
+tests/out/
+__pycache__/

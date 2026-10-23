@@ -1,0 +1,330 @@
+{
+  "plan": "family-room.jpeg",
+  "note": "Sample plan 2. Coordinates in ORIGINAL image pixels (1600x1117).",
+  "tol": 12,
+  "walls": [
+    {
+      "name": "west exterior",
+      "seg": [
+        375,
+        200,
+        375,
+        842
+      ]
+    },
+    {
+      "name": "east exterior",
+      "seg": [
+        1250,
+        200,
+        1250,
+        842
+      ]
+    },
+    {
+      "name": "north exterior",
+      "seg": [
+        375,
+        200,
+        1250,
+        200
+      ]
+    },
+    {
+      "name": "south exterior",
+      "seg": [
+        375,
+        842,
+        1250,
+        842
+      ]
+    },
+    {
+      "name": "bedrooms / living",
+      "seg": [
+        375,
+        476,
+        1250,
+        476
+      ]
+    },
+    {
+      "name": "bath west",
+      "seg": [
+        850,
+        200,
+        850,
+        476
+      ]
+    },
+    {
+      "name": "bath east",
+      "seg": [
+        965,
+        200,
+        965,
+        476
+      ]
+    },
+    {
+      "name": "closet / washroom west",
+      "seg": [
+        1110,
+        476,
+        1110,
+        842
+      ]
+    },
+    {
+      "name": "closet / washroom divider",
+      "seg": [
+        1110,
+        630,
+        1250,
+        630
+      ]
+    }
+  ],
+  "open": [
+    {
+      "name": "open living (no wall across it)",
+      "seg": [
+        400,
+        560,
+        1090,
+        560
+      ]
+    },
+    {
+      "name": "open family / dining",
+      "seg": [
+        720,
+        500,
+        720,
+        820
+      ]
+    },
+    {
+      "name": "open dining / kitchen",
+      "seg": [
+        1000,
+        500,
+        1000,
+        800
+      ]
+    }
+  ],
+  "openings": [
+    {
+      "name": "bedroom 2 window",
+      "type": "window",
+      "seg": [
+        375,
+        210,
+        375,
+        436
+      ]
+    },
+    {
+      "name": "family room side window",
+      "type": "window",
+      "seg": [
+        375,
+        561,
+        375,
+        767
+      ]
+    },
+    {
+      "name": "bedroom 3 window",
+      "type": "window",
+      "seg": [
+        697,
+        200,
+        797,
+        200
+      ]
+    },
+    {
+      "name": "master window",
+      "type": "window",
+      "seg": [
+        1250,
+        210,
+        1250,
+        439
+      ]
+    },
+    {
+      "name": "bedroom 2 door",
+      "type": "door",
+      "seg": [
+        516,
+        476,
+        572,
+        476
+      ]
+    },
+    {
+      "name": "bedroom 3 door",
+      "type": "door",
+      "seg": [
+        775,
+        476,
+        830,
+        476
+      ]
+    },
+    {
+      "name": "bath door",
+      "type": "door",
+      "seg": [
+        906,
+        476,
+        959,
+        476
+      ]
+    },
+    {
+      "name": "master door",
+      "type": "door",
+      "seg": [
+        978,
+        476,
+        1040,
+        476
+      ]
+    },
+    {
+      "name": "front door",
+      "type": "door",
+      "seg": [
+        660,
+        842,
+        726,
+        842
+      ]
+    },
+    {
+      "name": "family front window",
+      "type": "window",
+      "seg": [
+        494,
+        842,
+        576,
+        842
+      ]
+    },
+    {
+      "name": "kitchen window",
+      "type": "window",
+      "seg": [
+        981,
+        842,
+        1043,
+        842
+      ]
+    },
+    {
+      "name": "washroom outside door",
+      "type": "door",
+      "seg": [
+        1250,
+        705,
+        1250,
+        767
+      ]
+    }
+  ],
+  "rooms_inside": [
+    374,
+    200,
+    1250,
+    842
+  ],
+  "max_duplicate_walls": 0,
+  "names": [
+    {
+      "name": "Bedroom #2",
+      "at": [
+        475,
+        369
+      ],
+      "accept": [
+        "bedroom"
+      ]
+    },
+    {
+      "name": "Bedroom #3",
+      "at": [
+        739,
+        369
+      ],
+      "accept": [
+        "bedroom"
+      ]
+    },
+    {
+      "name": "Master Bedroom",
+      "at": [
+        1110,
+        384
+      ],
+      "accept": [
+        "master"
+      ]
+    },
+    {
+      "name": "Closet",
+      "at": [
+        1180,
+        551
+      ],
+      "accept": [
+        "closet"
+      ]
+    },
+    {
+      "name": "Family Room",
+      "at": [
+        532,
+        628
+      ],
+      "accept": [
+        "family"
+      ]
+    },
+    {
+      "name": "Dining Area",
+      "at": [
+        770,
+        628
+      ],
+      "accept": [
+        "dining"
+      ]
+    },
+    {
+      "name": "Kitchen",
+      "at": [
+        959,
+        628
+      ],
+      "accept": [
+        "kitchen"
+      ]
+    },
+    {
+      "name": "Washroom",
+      "at": [
+        1185,
+        736
+      ],
+      "accept": [
+        "washroom",
+        "laundry",
+        "bath"
+      ]
+    }
+  ]
+}
